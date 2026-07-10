@@ -26,9 +26,11 @@ OvmsVehicleMaxt90::OvmsVehicleMaxt90()
   // Define poll list:
   //  - State 0: vehicle off
   //  - State 1: vehicle on / driving
-  //  - State 2: charging (not used yet, but kept for future)
+  //  - State 2: charging (detected from the 0x795 charger broadcast)
   //
-  // Only READY (0xE004) is polled in state 0 to avoid keeping ECUs awake.
+  // Only READY (0xE004) is polled in state 0, so we don't keep the ECUs awake.
+  // The state-2 columns keep SOC, SOH and the temperatures updating while
+  // the car charges.
   static const OvmsPoller::poll_pid_t maxt90_polls[] = {
     // VIN (only when on / charge, slow rate)
     { 0x7e3, 0x7eb, VEHICLE_POLL_TYPE_OBDIIEXTENDED, 0xF190,
@@ -42,7 +44,7 @@ OvmsVehicleMaxt90::OvmsVehicleMaxt90()
     { 0x7e3, 0x7eb, VEHICLE_POLL_TYPE_OBDIIEXTENDED, 0xE003,
       { 0, 1800, 1800 }, 0, ISOTP_STD },
 
-    // READY flag – polled in all states, faster in "off" to detect wake
+    // READY flag, polled in all states, faster in "off" to detect wake
     { 0x7e3, 0x7eb, VEHICLE_POLL_TYPE_OBDIIEXTENDED, 0xE004,
       { 5, 10, 10 }, 0, ISOTP_STD },
 
@@ -57,6 +59,11 @@ OvmsVehicleMaxt90::OvmsVehicleMaxt90()
     // Ambient temp
     { 0x7e3, 0x7eb, VEHICLE_POLL_TYPE_OBDIIEXTENDED, 0xE025,
       { 0, 30, 30 }, 0, ISOTP_STD },
+
+    // AC charge current in whole amps, read from the on-board charger
+    // (0x722). Only polled while charging.
+    { 0x722, 0x7a2, VEHICLE_POLL_TYPE_OBDIIEXTENDED, 0xE001,
+      { 0, 0, 10 }, 0, ISOTP_STD },
 
     POLL_LIST_END
   };
@@ -98,7 +105,7 @@ void OvmsVehicleMaxt90::IncomingFrameCan1(CAN_frame_t* p_frame)
       {
         bool locked = (state == 0xA9);
 
-        // Standard OVMS metric – used by apps / HA:
+        // Standard OVMS metric, used by apps / HA:
         StdMetrics.ms_v_env_locked->SetValue(locked);
 
         ESP_LOGI(TAG, "Lock state changed: %s (CAN 0x281 byte1=0x%02x)",
@@ -106,6 +113,12 @@ void OvmsVehicleMaxt90::IncomingFrameCan1(CAN_frame_t* p_frame)
 
         last_state = state;
       }
+      break;
+    }
+
+    case 0x795: // Charger status broadcast (only sent while an EVSE is connected)
+    {
+      HandleCharger795(d, p_frame->FIR.B.DLC);
       break;
     }
 
@@ -209,15 +222,9 @@ void OvmsVehicleMaxt90::IncomingPollReply(const OvmsPoller::poll_job_t& job,
         if (ready != prev_ready) {
           ESP_LOGI(TAG, "READY flag changed: raw=0x%04x ready=%s",
                    v, ready ? "true" : "false");
-
-          if (!ready && m_poll_state != 0) {
-            ESP_LOGI(TAG, "Vehicle OFF detected, setting poll state 0");
-            PollSetState(0);
-          }
-          else if (ready && m_poll_state == 0) {
-            ESP_LOGI(TAG, "Vehicle ON detected, setting poll state 1");
-            PollSetState(1);
-          }
+          // We don't change the poll state here. PollerStateTicker() works it
+          // out from the charge and ready flags together, so a "not ready"
+          // reading while charging can't knock us out of state 2.
         }
       }
       break;
@@ -290,8 +297,134 @@ void OvmsVehicleMaxt90::IncomingPollReply(const OvmsPoller::poll_job_t& job,
       break;
     }
 
+    case 0xE001: { // AC charge current from the on-board charger (0x722)
+      // Checked against a metered wall plug: reads 0 when idle, 7 at ~8 A
+      // and 12 at ~13 A, so the value is whole amps only. The on-board
+      // charger (0x7a2) should be the only module answering this PID, but
+      // check the module id anyway.
+      if (job.moduleid_rec == 0x7a2 && length >= 1) {
+        float amps = data[0];
+        StdMetrics.ms_v_charge_current->SetValue(amps);
+        ESP_LOGD(TAG, "Charge current: %.0f A", amps);
+      }
+      break;
+    }
+
     default:
       break;
+  }
+}
+
+// ─────────────────────────────────────────────
+//  Charge Status (0x795 broadcast)
+// ─────────────────────────────────────────────
+//
+// The car broadcasts charger status frame 0x795 about 7 times a second,
+// but only while an EVSE is physically connected. Payloads observed on an
+// AC granny lead:
+//
+//   charging : 00 0a a4 00 28 00 00 00
+//   plugged  : 00 00 00 00 00 00 00 00   (connected but not delivering)
+//   unplugged: frame stops being sent entirely
+//
+// So receiving the frame at all means the pilot is present, and a non-zero
+// payload means the car is charging.
+//
+// Byte 4 (0x28) is not the charge current. It reads the same 0x28 at 6 A,
+// 8 A and 13 A charge rates (checked against a metered smart plug), so it
+// looks like a constant or a mode flag. The real charge current comes from
+// the on-board charger via the 0xE001 poll.
+void OvmsVehicleMaxt90::HandleCharger795(const uint8_t* d, uint8_t length)
+{
+  // Any 0x795 frame means an EVSE is connected:
+  m_evse_seen_secs = 10;
+  StdMetrics.ms_v_charge_pilot->SetValue(true);
+  StdMetrics.ms_v_door_chargeport->SetValue(true);
+
+  // A non-zero payload means current is flowing. A zero payload means the
+  // car is plugged in but not charging; we don't declare the charge stopped
+  // here, the m_charge_seen_secs timeout in Ticker1 does that.
+  bool current_flowing = (length >= 5) && (d[4] != 0);
+
+  if (current_flowing) {
+    m_charge_seen_secs = 5; // ride out brief drop-outs before calling it stopped
+
+    if (!StdMetrics.ms_v_charge_inprogress->AsBool()) {
+      ESP_LOGI(TAG, "Charge started (0x795 payload non-zero)");
+
+      StdMetrics.ms_v_charge_inprogress->SetValue(true);
+      StdMetrics.ms_v_charge_mode->SetValue("standard");
+      StdMetrics.ms_v_charge_state->SetValue("charging");
+      StdMetrics.ms_v_charge_substate->SetValue("onrequest");
+      // We've only seen AC (type2) charging so far. DC/CCS detection is
+      // still to do.
+      StdMetrics.ms_v_charge_type->SetValue("type2");
+    }
+  }
+}
+
+// Charging has ended. If evse_present is false the cable is unplugged too.
+void OvmsVehicleMaxt90::SetChargeStopped(bool evse_present)
+{
+  if (StdMetrics.ms_v_charge_inprogress->AsBool())
+    ESP_LOGI(TAG, "Charge stopped (evse_present=%s)",
+             evse_present ? "true" : "false");
+
+  StdMetrics.ms_v_charge_inprogress->SetValue(false);
+  StdMetrics.ms_v_charge_current->SetValue(0);
+  StdMetrics.ms_v_charge_state->SetValue(evse_present ? "stopped" : "");
+  StdMetrics.ms_v_charge_substate->SetValue("");
+
+  StdMetrics.ms_v_charge_pilot->SetValue(evse_present);
+  StdMetrics.ms_v_door_chargeport->SetValue(evse_present);
+  if (!evse_present) {
+    StdMetrics.ms_v_charge_mode->SetValue("");
+    StdMetrics.ms_v_charge_type->SetValue("");
+  }
+}
+
+// The framework calls this once a second, just before the next poll is
+// sent. It's the only place the poll state changes, so the charge and
+// ready signals can't fight over it:
+//   charging -> 2,  ready (on) -> 1,  otherwise -> 0
+void OvmsVehicleMaxt90::PollerStateTicker(canbus* bus)
+{
+  bool charging = StdMetrics.ms_v_charge_inprogress->AsBool();
+
+  uint8_t want;
+  if (charging)
+    want = 2;
+  else if (StdMetrics.ms_v_env_on->AsBool())
+    want = 1;
+  else
+    want = 0;
+
+  if (m_poll_state != want) {
+    ESP_LOGI(TAG, "Poll state %d -> %d (charge=%s on=%s)",
+             m_poll_state, want,
+             charging ? "true" : "false",
+             StdMetrics.ms_v_env_on->AsBool() ? "true" : "false");
+    PollSetState(want);
+  }
+}
+
+// ─────────────────────────────────────────────
+//  1 Hz Tick (0x795 broadcast timeouts)
+// ─────────────────────────────────────────────
+void OvmsVehicleMaxt90::Ticker1(uint32_t ticker)
+{
+  // If the current stops while the cable is still plugged in, the charge
+  // has stopped.
+  if (m_charge_seen_secs > 0) {
+    if (--m_charge_seen_secs == 0 &&
+        StdMetrics.ms_v_charge_inprogress->AsBool() && m_evse_seen_secs > 0)
+      SetChargeStopped(/*evse_present=*/true);
+  }
+
+  // When 0x795 stops arriving entirely, the cable has been unplugged.
+  if (m_evse_seen_secs > 0) {
+    if (--m_evse_seen_secs == 0)
+      SetChargeStopped(/*evse_present=*/false);
   }
 }
 

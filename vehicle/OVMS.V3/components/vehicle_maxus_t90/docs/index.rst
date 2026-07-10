@@ -3,11 +3,12 @@ Maxus T90 EV (MT90)
 
 Vehicle type code: ``MT90``
 
-The Maxus T90 EV module provides basic battery, temperature and lock/odometer
-integration using the vehicle OBD-II port and a single CAN bus at 500 kbps.
+The Maxus T90 EV module provides basic battery, charging, temperature and
+lock/odometer integration using the vehicle OBD-II port and a single CAN bus
+at 500 kbps.
 
-The implementation is still under active development; this page reflects the
-current feature set in the initial version of the module.
+The module is still under active development; this page reflects the current
+feature set.
 
 
 Hardware & Installation
@@ -72,9 +73,23 @@ Feature Coverage
    * - Speed display
      - No (vehicle-specific)
      - Only GPS-based speed available via OVMS core
-   * - Charge state / power / energy
+   * - Charge state / in progress
+     - Partial
+     - From CAN ID ``0x795`` (charger status broadcast) →
+       ``ms_v_charge_inprogress``, ``ms_v_charge_state``,
+       ``ms_v_charge_pilot``, ``ms_v_door_chargeport``. While charging,
+       the module also keeps SOC, SOH and temperatures updating.
+   * - Charge current
+     - Yes
+     - From OBD-II PID ``0xE001`` on the on-board charger (``0x722``) →
+       ``ms_v_charge_current``. Whole amps, within about 1 A of the real
+       value. Checked against a metered plug at 6, 8, 10 and 13 A. (Byte 4
+       of ``0x795`` reads the same value at every rate, so it isn't the
+       current.)
+   * - Charge power / energy counters
      - No
-     - Not yet implemented for this vehicle
+     - The charger ECU only gives whole-amp current and AC voltage, so
+       there is nothing to calculate power or energy from
    * - Charge control (start/stop, limits)
      - No
      - Not yet implemented
@@ -114,13 +129,18 @@ Implementation Notes
   
   * State 0: vehicle off  
   * State 1: vehicle on / driving  
-  * State 2: charging (reserved for future use)
+  * State 2: charging
 
-* In the initial implementation only the READY flag (PID ``0xE004``) is polled
-  in state 0 to avoid keeping ECUs awake while parked; other PIDs are only
-  polled when the vehicle is on.
-* The READY bitfield is used to drive ``ms_v_env_on`` and to switch poll
-  states between 0 (off) and 1 (on).
+* Only the READY flag (PID ``0xE004``) is polled in state 0, so the ECUs
+  aren't kept awake while parked. The other PIDs are only polled while the
+  vehicle is on or charging.
+* The READY bitfield drives ``ms_v_env_on``. The poll state is worked out
+  once a second in ``PollerStateTicker()`` from the charge and ready flags
+  together: charging → 2, ready → 1, otherwise → 0.
+* Charging is detected from the ``0x795`` charger status broadcast, which
+  the car only sends while a cable is plugged in. A non-zero payload means
+  current is flowing. Countdown timers in ``Ticker1`` clear the charge
+  state when the frames stop.
 * Odometer is taken from CAN ID ``0x540`` using bytes [4..6] as a 24-bit
   little-endian value with 0.1 km resolution.
 * Lock status is decoded from CAN ID ``0x281`` (body control module) using
@@ -142,7 +162,8 @@ Planned / Potential Extensions
 The following features are candidates for future updates once the relevant
 PIDs and CAN messages have been fully reverse engineered:
 
-* Charge state / mode / power and energy counters.
+* Charge power and energy counters, if a usable source turns up (the
+  charger ECU has none).
 * Distinguishing AC vs. DC charging.
 * More detailed BMS data (cell voltages, min/max temperatures, etc.).
 * Additional body / door / window state.
