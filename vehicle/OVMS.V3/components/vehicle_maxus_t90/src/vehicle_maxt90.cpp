@@ -22,6 +22,17 @@ OvmsVehicleMaxt90::OvmsVehicleMaxt90()
     MyMetrics.InitFloat("xmt.v.hvac.temp", 10, 0.0f, Celcius, false);
   m_pack_capacity_kwh =
     MyMetrics.InitFloat("xmt.b.capacity", 0, 88.5f, kWh, true);
+  m_dcdc_voltage =
+    MyMetrics.InitFloat("xmt.v.dcdc.voltage", 120, 0.0f, Volts, false);
+
+  // BMS cell monitor. The BMS reports 110 cell voltages (LFP, ~3.31 V each)
+  // and 3 temperature sensors; the arrangement follows what 0xB142 returns.
+  BmsSetCellArrangementVoltage(110, 10);
+  BmsSetCellArrangementTemperature(3, 1);
+  BmsSetCellLimitsVoltage(2.0, 4.5);
+  BmsSetCellLimitsTemperature(-39, 200);
+  BmsSetCellDefaultThresholdsVoltage(0.020, 0.030);
+  BmsSetCellDefaultThresholdsTemperature(2.0, 3.0);
 
   // Define poll list:
   //  - State 0: vehicle off
@@ -64,6 +75,28 @@ OvmsVehicleMaxt90::OvmsVehicleMaxt90()
     // (0x722). Only polled while charging.
     { 0x722, 0x7a2, VEHICLE_POLL_TYPE_OBDIIEXTENDED, 0xE001,
       { 0, 0, 10 }, 0, ISOTP_STD },
+
+    // 12V system current (VCU)
+    { 0x7e3, 0x7eb, VEHICLE_POLL_TYPE_OBDIIEXTENDED, 0xE022,
+      { 0, 30, 30 }, 0, ISOTP_STD },
+
+    // BMS (0x748/0x7c8) battery data. The BMS uses a 0xB1xx DID map,
+    // not the 0xE0xx map the eDeliver3 uses.
+    // Pack voltage
+    { 0x748, 0x7c8, VEHICLE_POLL_TYPE_OBDIIEXTENDED, 0xB105,
+      { 0, 10, 10 }, 0, ISOTP_STD },
+    // Cell voltage max / min / average
+    { 0x748, 0x7c8, VEHICLE_POLL_TYPE_OBDIIEXTENDED, 0xB114,
+      { 0, 30, 30 }, 0, ISOTP_STD },
+    // Pack temperature sensors (3)
+    { 0x748, 0x7c8, VEHICLE_POLL_TYPE_OBDIIEXTENDED, 0xB110,
+      { 0, 30, 30 }, 0, ISOTP_STD },
+    // 12V DC-DC output voltage
+    { 0x748, 0x7c8, VEHICLE_POLL_TYPE_OBDIIEXTENDED, 0xB136,
+      { 0, 60, 60 }, 0, ISOTP_STD },
+    // Full cell voltage array (multi-frame reply)
+    { 0x748, 0x7c8, VEHICLE_POLL_TYPE_OBDIIEXTENDED, 0xB142,
+      { 0, 60, 60 }, 0, ISOTP_STD },
 
     POLL_LIST_END
   };
@@ -164,12 +197,24 @@ void OvmsVehicleMaxt90::IncomingFrameCan1(CAN_frame_t* p_frame)
 void OvmsVehicleMaxt90::IncomingPollReply(const OvmsPoller::poll_job_t& job,
                                           uint8_t* data, uint8_t length)
 {
+  // A reply can arrive split over several frames (VIN, the cell voltage
+  // array). Collect the pieces and decode once the last frame is in.
+  if (job.mlframe == 0) {
+    m_rxbuf.clear();
+    m_rxbuf.reserve(length + job.mlremain);
+  }
+  m_rxbuf.append(reinterpret_cast<char*>(data), length);
+  if (job.mlremain)
+    return;
+
+  const uint8_t* d = reinterpret_cast<const uint8_t*>(m_rxbuf.data());
+  size_t len = m_rxbuf.size();
+
   switch (job.pid)
   {
     case 0xF190: { // VIN (ASCII)
-      if (length >= 1) {
-        std::string vin(reinterpret_cast<char*>(data),
-                        reinterpret_cast<char*>(data) + length);
+      if (len >= 1) {
+        std::string vin(reinterpret_cast<const char*>(d), len);
         StdMetrics.ms_v_vin->SetValue(vin);
         ESP_LOGD(TAG, "VIN: %s", vin.c_str());
       }
@@ -177,8 +222,8 @@ void OvmsVehicleMaxt90::IncomingPollReply(const OvmsPoller::poll_job_t& job,
     }
 
     case 0xE002: { // SOC (%)
-      if (length >= 1) {
-        float soc = data[0];
+      if (len >= 1) {
+        float soc = d[0];
         if (soc > 0 && soc <= 100) {
           if (StdMetrics.ms_v_bat_soc->AsFloat() != soc) {
             StdMetrics.ms_v_bat_soc->SetValue(soc);
@@ -194,8 +239,8 @@ void OvmsVehicleMaxt90::IncomingPollReply(const OvmsPoller::poll_job_t& job,
     }
 
     case 0xE003: { // SOH (%)
-      if (length >= 2) {
-        uint16_t raw = u16be(data);
+      if (len >= 2) {
+        uint16_t raw = u16be(d);
         float soh = raw / 100.0f;
 
         // Filter out bogus default values (0xFFFF, 0x1800 = 61.44%, etc.)
@@ -213,8 +258,8 @@ void OvmsVehicleMaxt90::IncomingPollReply(const OvmsPoller::poll_job_t& job,
     }
 
     case 0xE004: { // READY bitfield
-      if (length >= 2) {
-        uint16_t v = u16be(data);
+      if (len >= 2) {
+        uint16_t v = u16be(d);
         bool ready = (v & 0x000C) != 0;
         bool prev_ready = StdMetrics.ms_v_env_on->AsBool();
         StdMetrics.ms_v_env_on->SetValue(ready);
@@ -231,8 +276,8 @@ void OvmsVehicleMaxt90::IncomingPollReply(const OvmsPoller::poll_job_t& job,
     }
 
     case 0xE009: { // Plug present (u16)
-      if (length >= 2) {
-        uint16_t v = u16be(data);
+      if (len >= 2) {
+        uint16_t v = u16be(d);
         bool plug_present = ((v & 0x00FF) == 0x00);
         StdMetrics.ms_v_charge_pilot->SetValue(plug_present);
         ESP_LOGD(TAG, "Plug present: raw=0x%04x plug=%s",
@@ -242,8 +287,8 @@ void OvmsVehicleMaxt90::IncomingPollReply(const OvmsPoller::poll_job_t& job,
     }
 
     case 0xE010: { // HVAC/Coolant temperature (°C)
-      if (length >= 2 && m_hvac_temp_c) {
-        uint16_t raw = u16be(data);
+      if (len >= 2 && m_hvac_temp_c) {
+        uint16_t raw = u16be(d);
         float t = raw / 10.0f;
 
         bool env_on = StdMetrics.ms_v_env_on->AsBool();
@@ -270,8 +315,8 @@ void OvmsVehicleMaxt90::IncomingPollReply(const OvmsPoller::poll_job_t& job,
     }
 
     case 0xE025: { // Ambient temperature (°C)
-      if (length >= 2) {
-        uint16_t raw = u16be(data);
+      if (len >= 2) {
+        uint16_t raw = u16be(d);
         float ta = raw / 10.0f;
 
         bool env_on = StdMetrics.ms_v_env_on->AsBool();
@@ -302,10 +347,76 @@ void OvmsVehicleMaxt90::IncomingPollReply(const OvmsPoller::poll_job_t& job,
       // and 12 at ~13 A, so the value is whole amps only. The on-board
       // charger (0x7a2) should be the only module answering this PID, but
       // check the module id anyway.
-      if (job.moduleid_rec == 0x7a2 && length >= 1) {
-        float amps = data[0];
+      if (job.moduleid_rec == 0x7a2 && len >= 1) {
+        float amps = d[0];
         StdMetrics.ms_v_charge_current->SetValue(amps);
         ESP_LOGD(TAG, "Charge current: %.0f A", amps);
+      }
+      break;
+    }
+
+    case 0xE022: { // 12V system current from the VCU
+      // Read 0xA3 = 163 while charging, which matches a plausible 16.3 A,
+      // so we take it as 0.1 A units (medium confidence).
+      if (job.moduleid_rec == 0x7eb && len >= 1) {
+        float amps = ((len >= 2) ? u16be(d) : d[0]) / 10.0f;
+        StdMetrics.ms_v_bat_12v_current->SetValue(amps);
+      }
+      break;
+    }
+
+    case 0xB105: { // Pack voltage from the BMS (u16, 0.01 V units)
+      if (job.moduleid_rec == 0x7c8 && len >= 2) {
+        float volts = u16be(d) / 100.0f;
+        if (volts > 100 && volts < 500)
+          StdMetrics.ms_v_bat_voltage->SetValue(volts);
+      }
+      break;
+    }
+
+    case 0xB114: { // Cell voltage max / min / average (3 x u16, mV)
+      if (job.moduleid_rec == 0x7c8 && len >= 6) {
+        StdMetrics.ms_v_bat_pack_vmax->SetValue(u16be(d) / 1000.0f);
+        StdMetrics.ms_v_bat_pack_vmin->SetValue(u16be(d + 2) / 1000.0f);
+        StdMetrics.ms_v_bat_pack_vavg->SetValue(u16be(d + 4) / 1000.0f);
+      }
+      break;
+    }
+
+    case 0xB110: { // Pack temperature sensors (3 x s16, 0.1 °C units)
+      if (job.moduleid_rec == 0x7c8 && len >= 6) {
+        float sum = 0;
+        BmsRestartCellTemperatures();
+        for (int i = 0; i < 3; i++) {
+          float t = (int16_t)u16be(d + i * 2) / 10.0f;
+          BmsSetCellTemperature(i, t);
+          sum += t;
+        }
+        StdMetrics.ms_v_bat_temp->SetValue(sum / 3.0f);
+      }
+      break;
+    }
+
+    case 0xB136: { // 12V DC-DC output voltage (u16, 0.01 V units)
+      if (job.moduleid_rec == 0x7c8 && len >= 2 && m_dcdc_voltage)
+        m_dcdc_voltage->SetValue(u16be(d) / 100.0f);
+      break;
+    }
+
+    case 0xB142: { // Full cell voltage array (u16 mV per cell, multi-frame)
+      // The BMS reports 110 values of about 3.31 V each. The pack maths
+      // (88.5 kWh, 270 Ah, 327 V from 0xB105) points at roughly 99 series
+      // cells, so the extra entries are unexplained. We show what the BMS
+      // reports and size the monitor from the reply.
+      if (job.moduleid_rec == 0x7c8 && len >= 4 && (len % 2) == 0) {
+        int cells = len / 2;
+        if (cells != m_bms_cells) {
+          BmsSetCellArrangementVoltage(cells, 10);
+          m_bms_cells = cells;
+        }
+        BmsRestartCellVoltages();
+        for (int i = 0; i < cells; i++)
+          BmsSetCellVoltage(i, u16be(d + i * 2) / 1000.0f);
       }
       break;
     }

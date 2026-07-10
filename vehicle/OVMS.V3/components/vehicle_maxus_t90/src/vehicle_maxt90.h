@@ -1,6 +1,8 @@
 #ifndef __VEHICLE_MAXT90_H__
 #define __VEHICLE_MAXT90_H__
 
+#include <string>
+
 #include "vehicle_obdii.h"
 #include "ovms_metrics.h"
 
@@ -28,10 +30,20 @@ protected:
 
 private:
   // Custom metrics:
-  //  - xmt.v.hvac.temp  : HVAC / coolant temperature (°C)
-  //  - xmt.b.capacity   : Nominal pack capacity (kWh)
+  //  - xmt.v.hvac.temp    : HVAC / coolant temperature (°C)
+  //  - xmt.b.capacity     : Nominal pack capacity (kWh)
+  //  - xmt.v.dcdc.voltage : 12V DC-DC output voltage (V)
   OvmsMetricFloat* m_hvac_temp_c       = nullptr; // xmt.v.hvac.temp
   OvmsMetricFloat* m_pack_capacity_kwh = nullptr; // xmt.b.capacity
+  OvmsMetricFloat* m_dcdc_voltage      = nullptr; // xmt.v.dcdc.voltage
+
+  // Reassembly buffer for poll replies that span several frames
+  // (VIN, BMS cell voltage array):
+  std::string m_rxbuf;
+
+  // Cell count last reported by BMS DID 0xB142; sets the BMS monitor
+  // arrangement when it changes:
+  int m_bms_cells = 110;
 
   // Charge state, driven by the 0x795 charger-status broadcast. Ticker1
   // counts these down once a second and the broadcast resets them, so when

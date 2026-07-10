@@ -49,6 +49,26 @@ Feature Coverage
    * - Battery capacity
      - Yes
      - Custom metric ``xmt.b.capacity`` (fixed 88.5 kWh)
+   * - Pack voltage
+     - Yes
+     - From BMS DID ``0xB105`` → ``ms_v_bat_voltage`` (read 327 V live)
+   * - Cell voltages (BMS monitor)
+     - Yes
+     - From BMS DID ``0xB142`` (full array, polled every 60 s) plus
+       ``0xB114`` (max / min / average). The BMS reports 110 values of
+       about 3.31 V each; the pack maths (88.5 kWh, 270 Ah, 327 V) points
+       at roughly 99 series cells, so the reported count is not settled.
+   * - Battery temperatures
+     - Yes
+     - From BMS DID ``0xB110`` (3 sensors) → BMS monitor and
+       ``ms_v_bat_temp``
+   * - 12V battery current
+     - Yes
+     - From VCU PID ``0xE022`` → ``ms_v_bat_12v_current`` (0.1 A units,
+       medium confidence)
+   * - 12V DC-DC output voltage
+     - Yes
+     - Custom metric ``xmt.v.dcdc.voltage`` (BMS ``0xB136``)
    * - Odometer
      - Yes
      - From CAN ID ``0x540`` → ``ms_v_pos_odometer`` (0.1 km resolution)
@@ -141,6 +161,13 @@ Implementation Notes
   the car only sends while a cable is plugged in. A non-zero payload means
   current is flowing. Countdown timers in ``Ticker1`` clear the charge
   state when the frames stop.
+* Battery data comes from the BMS on ``0x748/0x7C8``, which uses a
+  ``0xB1xx`` DID map (not the ``0xE0xx`` map the eDeliver3 uses):
+  ``B105`` pack voltage, ``B142`` cell voltage array, ``B110`` temperature
+  sensors, ``B136`` DC-DC output voltage. These are only polled while the
+  vehicle is on or charging, so the BMS is never queried while the car
+  sleeps. (``B12A`` looked like raw SOC in early scans but stays near 50%
+  regardless of the actual state of charge, so it is not used.)
 * Odometer is taken from CAN ID ``0x540`` using bytes [4..6] as a 24-bit
   little-endian value with 0.1 km resolution.
 * Lock status is decoded from CAN ID ``0x281`` (body control module) using
@@ -165,6 +192,7 @@ PIDs and CAN messages have been fully reverse engineered:
 * Charge power and energy counters, if a usable source turns up (the
   charger ECU has none).
 * Distinguishing AC vs. DC charging.
-* More detailed BMS data (cell voltages, min/max temperatures, etc.).
+* Pack DC current (not found in the BMS ``0xB1xx`` block yet; finding it
+  would unlock DC power and consumption figures).
 * Additional body / door / window state.
 * Remote climate control and other remote vehicle actions, if feasible.
