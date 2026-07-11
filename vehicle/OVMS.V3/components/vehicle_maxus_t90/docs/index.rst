@@ -74,7 +74,8 @@ Feature Coverage
      - From CAN ID ``0x540`` → ``ms_v_pos_odometer`` (0.1 km resolution)
    * - Vehicle READY / ignition state
      - Yes
-     - From OBD-II PID ``0xE004`` → ``ms_v_env_on`` and poll state control
+     - From the ``0x266`` powertrain broadcast, which the car only sends
+       while switched on → ``ms_v_env_on`` and poll state control
    * - Lock status
      - Yes
      - From CAN ID ``0x281`` → ``ms_v_env_locked`` (locked/unlocked)
@@ -92,20 +93,21 @@ Feature Coverage
      - Provided by the OVMS modem GPS (not vehicle-specific)
    * - Speed display
      - No (vehicle-specific)
-     - Only GPS-based speed available via OVMS core
+     - Not present on the powertrain CAN (checked against drive captures);
+       only GPS-based speed available via OVMS core
    * - Charge state / in progress
-     - Partial
-     - From CAN ID ``0x795`` (charger status broadcast) →
-       ``ms_v_charge_inprogress``, ``ms_v_charge_state``,
-       ``ms_v_charge_pilot``, ``ms_v_door_chargeport``. While charging,
+     - Yes
+     - Worked out from several signals together (see the implementation
+       notes) → ``ms_v_charge_inprogress``, ``ms_v_charge_state``.
+       Detects both AC and DC charging; verified against captures of a
+       granny-lead AC charge and a 50 kW CCS rapid charge. While charging,
        the module also keeps SOC, SOH and temperatures updating.
-   * - Charge current
+   * - Charge current (AC)
      - Yes
      - From OBD-II PID ``0xE001`` on the on-board charger (``0x722``) →
        ``ms_v_charge_current``. Whole amps, within about 1 A of the real
-       value. Checked against a metered plug at 6, 8, 10 and 13 A. (Byte 4
-       of ``0x795`` reads the same value at every rate, so it isn't the
-       current.)
+       value. Checked against a metered plug at 6, 8, 10 and 13 A. Reads
+       zero during a DC charge, where the on-board charger isn't involved.
    * - Charge power / energy counters
      - No
      - The charger ECU only gives whole-amp current and AC voltage, so
@@ -134,9 +136,10 @@ Feature Coverage
    * - Valet mode
      - No
      - Not implemented for this vehicle
-   * - AC / DC charge mode detection
-     - No
-     - Not yet implemented
+   * - AC / DC charge type detection
+     - Yes
+     - ``ms_v_charge_type`` reads ``type2`` once the on-board charger
+       reports AC current, or ``ccs`` when it stays at zero during a charge
 
 
 Implementation Notes
@@ -151,16 +154,27 @@ Implementation Notes
   * State 1: vehicle on / driving  
   * State 2: charging
 
-* Only the READY flag (PID ``0xE004``) is polled in state 0, so the ECUs
+* Only the plug detect (PID ``0xE009``) is polled in state 0, so the ECUs
   aren't kept awake while parked. The other PIDs are only polled while the
   vehicle is on or charging.
-* The READY bitfield drives ``ms_v_env_on``. The poll state is worked out
-  once a second in ``PollerStateTicker()`` from the charge and ready flags
-  together: charging → 2, ready → 1, otherwise → 0.
-* Charging is detected from the ``0x795`` charger status broadcast, which
-  the car only sends while a cable is plugged in. A non-zero payload means
-  current is flowing. Countdown timers in ``Ticker1`` clear the charge
-  state when the frames stop.
+* The car being on is detected from the ``0x266`` powertrain broadcast,
+  which is only sent while the car is switched on. (PID ``0xE004`` was
+  first read as a READY flag, but it varies with load while driving, so it
+  is some other value and is no longer used for this.) The poll state is
+  worked out once a second in ``PollerStateTicker()``: charging → 2,
+  on → 1, otherwise → 0.
+* Charge detection combines four signals, each of which rules out a false
+  positive seen in real captures. Charging means all of: the ``0x795``
+  broadcast reports the HV system live (it sends the same payload when
+  driving and during both charge types, so it can't be used alone), the
+  car is not switched on (no ``0x266``), the cable is in (``0xE009``),
+  and the car's own telematics is polling the BMS (``0x748`` requests
+  seen on the bus, which don't happen when the car just wakes because a
+  door was opened). Countdown timers in ``Ticker1`` clear each condition
+  when its frames stop.
+* The charge type is settled a few seconds into the charge: ``type2``
+  once the on-board charger reports AC current, ``ccs`` if it stays at
+  zero.
 * Battery data comes from the BMS on ``0x748/0x7C8``, which uses a
   ``0xB1xx`` DID map (not the ``0xE0xx`` map the eDeliver3 uses):
   ``B105`` pack voltage, ``B142`` cell voltage array, ``B110`` temperature
@@ -191,8 +205,11 @@ PIDs and CAN messages have been fully reverse engineered:
 
 * Charge power and energy counters, if a usable source turns up (the
   charger ECU has none).
-* Distinguishing AC vs. DC charging.
-* Pack DC current (not found in the BMS ``0xB1xx`` block yet; finding it
-  would unlock DC power and consumption figures).
+* Pack DC current (not found in the BMS ``0xB1xx`` block or in any
+  broadcast frame during a 150 A DC charge; finding it would unlock DC
+  power and consumption figures).
+* Speed (not present on the powertrain CAN; the standard OBD speed PID
+  answers but always reads zero, so it likely needs the chassis CAN on
+  OBD pins 3 and 11).
 * Additional body / door / window state.
 * Remote climate control and other remote vehicle actions, if feasible.

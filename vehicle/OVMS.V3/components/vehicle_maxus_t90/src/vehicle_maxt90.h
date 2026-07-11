@@ -18,10 +18,11 @@ protected:
                          uint8_t* data, uint8_t length) override;
 
   // Raw CAN1 frames (lock status on 0x281, odometer on 0x540,
-  // charger status on 0x795, etc.):
+  // HV system status on 0x795, etc.):
   void IncomingFrameCan1(CAN_frame_t* p_frame) override;
 
-  // 1 Hz tick (used to time out the charger-status broadcast):
+  // 1 Hz tick: counts down the broadcast timers and works out the
+  // on / charging state from them:
   void Ticker1(uint32_t ticker) override;
 
   // Works out the poll state (charging -> 2, on -> 1, off -> 0). Called by
@@ -45,16 +46,33 @@ private:
   // arrangement when it changes:
   int m_bms_cells = 110;
 
-  // Charge state, driven by the 0x795 charger-status broadcast. Ticker1
-  // counts these down once a second and the broadcast resets them, so when
-  // the frames stop arriving the state clears itself. The charging flag
-  // itself is the standard ms_v_charge_inprogress metric.
-  int  m_evse_seen_secs  = 0;     // >0 while 0x795 is being received (plugged in)
-  int  m_charge_seen_secs = 0;    // >0 while charge current is being seen
+  // On / charging detection state. The three countdown timers are refreshed
+  // by traffic seen in IncomingFrameCan1 and counted down once a second by
+  // Ticker1, so each condition clears itself when its frames stop:
+  //  - m_hv_seen_secs:      0x795 with a non-zero payload. The HV system is
+  //                         live, which happens when driving and during both
+  //                         AC and DC charging.
+  //  - m_on_seen_secs:      0x266 powertrain broadcast, only sent while the
+  //                         car is switched on. Drives ms_v_env_on.
+  //  - m_carpoll_seen_secs: the car's own telematics polling the BMS (0x748).
+  //                         Seen while driving or charging, but not when the
+  //                         car merely wakes because a door was opened.
+  int m_hv_seen_secs      = 0;
+  int m_on_seen_secs      = 0;
+  int m_carpoll_seen_secs = 0;
+
+  // Seconds the charge conditions have held (HV live, car off, plug in,
+  // car polling). The charge is declared once this reaches 10:
+  int m_charge_pending_secs = 0;
+
+  // Seconds since the charge started. Used to settle on "ccs" as the charge
+  // type when the on-board charger never reports any AC current:
+  int m_charge_secs = 0;
 
   // Charge status handlers / helpers:
   void HandleCharger795(const uint8_t* d, uint8_t length);
-  void SetChargeStopped(bool evse_present);
+  void SetChargeStarted();
+  void SetChargeStopped();
 
   // Helpers:
   static inline uint16_t u16be(const uint8_t* p)
