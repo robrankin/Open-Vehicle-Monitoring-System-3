@@ -51,13 +51,21 @@ Feature Coverage
      - Custom metric ``xmt.b.capacity`` (fixed 88.5 kWh)
    * - Pack voltage
      - Yes
-     - From BMS DID ``0xB105`` → ``ms_v_bat_voltage`` (read 327 V live)
+     - From the BMS cell data → ``ms_v_bat_voltage``: average cell voltage
+       (``0xB114``, every 30 s) times the cell count, refined by the exact
+       cell sum (``0xB142``, every 60 s). The pack is 110 LFP cells in
+       series, about 352 V nominal. (``0xB105`` looked like pack voltage
+       at first but is a computed limit; see the implementation notes.)
    * - Cell voltages (BMS monitor)
      - Yes
      - From BMS DID ``0xB142`` (full array, polled every 60 s) plus
-       ``0xB114`` (max / min / average). The BMS reports 110 values of
-       about 3.31 V each; the pack maths (88.5 kWh, 270 Ah, 327 V) points
-       at roughly 99 series cells, so the reported count is not settled.
+       ``0xB114`` (max / min / average). The BMS reports 110 cells and all
+       110 values move independently across charge and drive captures, so
+       the count is real.
+   * - BMS voltage limit
+     - Yes
+     - Custom metric ``xmt.b.voltage.limit`` from BMS DID ``0xB105``.
+       Behaves like a computed lower voltage limit, not a measurement.
    * - Battery temperatures
      - Yes
      - From BMS DID ``0xB110`` (3 sensors) → BMS monitor and
@@ -177,11 +185,19 @@ Implementation Notes
   zero.
 * Battery data comes from the BMS on ``0x748/0x7C8``, which uses a
   ``0xB1xx`` DID map (not the ``0xE0xx`` map the eDeliver3 uses):
-  ``B105`` pack voltage, ``B142`` cell voltage array, ``B110`` temperature
-  sensors, ``B136`` DC-DC output voltage. These are only polled while the
-  vehicle is on or charging, so the BMS is never queried while the car
-  sleeps. (``B12A`` looked like raw SOC in early scans but stays near 50%
-  regardless of the actual state of charge, so it is not used.)
+  ``B114`` cell max/min/average and ``B142`` full cell array (these feed
+  the pack voltage), ``B110`` temperature sensors, ``B136`` DC-DC output
+  voltage. These are only polled while the vehicle is on or charging, so
+  the BMS is never queried while the car sleeps.
+* ``B105`` looked like pack voltage at first (it reads a plausible 327 V),
+  but it reads BELOW the pack's resting voltage while a DC rapid charge
+  pushes 150 A in, which a terminal measurement can't do. It behaves like
+  a computed lower voltage limit, so it is kept as the custom metric
+  ``xmt.b.voltage.limit`` until its meaning is settled. It returns
+  ``0x8000`` as a "no value yet" marker while the pack electronics start
+  up; the module discards that. (``B12A`` looked like raw SOC in early
+  scans but stays near 50% regardless of the actual state of charge, so
+  it is not used.)
 * Odometer is taken from CAN ID ``0x540`` using bytes [4..6] as a 24-bit
   little-endian value with 0.1 km resolution.
 * Lock status is decoded from CAN ID ``0x281`` (body control module) using

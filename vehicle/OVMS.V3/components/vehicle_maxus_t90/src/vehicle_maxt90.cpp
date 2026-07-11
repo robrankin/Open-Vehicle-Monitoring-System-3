@@ -24,6 +24,8 @@ OvmsVehicleMaxt90::OvmsVehicleMaxt90()
     MyMetrics.InitFloat("xmt.b.capacity", 0, 88.5f, kWh, true);
   m_dcdc_voltage =
     MyMetrics.InitFloat("xmt.v.dcdc.voltage", 120, 0.0f, Volts, false);
+  m_batt_voltage_limit =
+    MyMetrics.InitFloat("xmt.b.voltage.limit", 120, 0.0f, Volts, false);
 
   // BMS cell monitor. The BMS reports 110 cell voltages (LFP, ~3.31 V each)
   // and 3 temperature sensors; the arrangement follows what 0xB142 returns.
@@ -379,11 +381,22 @@ void OvmsVehicleMaxt90::IncomingPollReply(const OvmsPoller::poll_job_t& job,
       break;
     }
 
-    case 0xB105: { // Pack voltage from the BMS (u16, 0.01 V units)
-      if (job.moduleid_rec == 0x7c8 && len >= 2) {
-        float volts = u16be(d) / 100.0f;
+    case 0xB105: { // BMS computed voltage limit (u16, 0.01 V units)
+      // This was first taken for the pack voltage, but it reads BELOW the
+      // resting voltage while a DC rapid charge pushes 150 A in, which a
+      // terminal measurement can't do. It behaves like a computed lower
+      // voltage limit (it rises as the pack warms during a rapid charge and
+      // sits ~40 V under the cell sum at rest), so it is kept as a custom
+      // metric until its meaning is settled. The real pack voltage comes
+      // from the cell data (0xB114 / 0xB142). 0x8000 is the BMS marker for
+      // "no value yet", seen while the pack electronics start up.
+      if (job.moduleid_rec == 0x7c8 && len >= 2 && m_batt_voltage_limit) {
+        uint16_t raw = u16be(d);
+        if (raw == 0x8000)
+          break;
+        float volts = raw / 100.0f;
         if (volts > 100 && volts < 500)
-          StdMetrics.ms_v_bat_voltage->SetValue(volts);
+          m_batt_voltage_limit->SetValue(volts);
       }
       break;
     }
@@ -392,7 +405,14 @@ void OvmsVehicleMaxt90::IncomingPollReply(const OvmsPoller::poll_job_t& job,
       if (job.moduleid_rec == 0x7c8 && len >= 6) {
         StdMetrics.ms_v_bat_pack_vmax->SetValue(u16be(d) / 1000.0f);
         StdMetrics.ms_v_bat_pack_vmin->SetValue(u16be(d + 2) / 1000.0f);
-        StdMetrics.ms_v_bat_pack_vavg->SetValue(u16be(d + 4) / 1000.0f);
+        float vavg = u16be(d + 4) / 1000.0f;
+        StdMetrics.ms_v_bat_pack_vavg->SetValue(vavg);
+        // Pack voltage = average cell voltage times the cell count. The
+        // full cell array (0xB142) refines this with the exact sum when it
+        // arrives; this keeps the value fresh between those slower polls.
+        float volts = vavg * m_bms_cells;
+        if (volts > 100 && volts < 500)
+          StdMetrics.ms_v_bat_voltage->SetValue(volts);
       }
       break;
     }
@@ -418,10 +438,11 @@ void OvmsVehicleMaxt90::IncomingPollReply(const OvmsPoller::poll_job_t& job,
     }
 
     case 0xB142: { // Full cell voltage array (u16 mV per cell, multi-frame)
-      // The BMS reports 110 values of about 3.31 V each. The pack maths
-      // (88.5 kWh, 270 Ah, 327 V from 0xB105) points at roughly 99 series
-      // cells, so the extra entries are unexplained. We show what the BMS
-      // reports and size the monitor from the reply.
+      // The pack is 110 LFP cells in series (about 352 V nominal). All 110
+      // reported values move independently across charge and drive
+      // captures, so the count is real. The monitor is sized from whatever
+      // the reply contains, and the exact cell sum is the most precise
+      // pack voltage available.
       if (job.moduleid_rec == 0x7c8 && len >= 4 && (len % 2) == 0) {
         int cells = len / 2;
         if (cells != m_bms_cells) {
@@ -429,8 +450,14 @@ void OvmsVehicleMaxt90::IncomingPollReply(const OvmsPoller::poll_job_t& job,
           m_bms_cells = cells;
         }
         BmsRestartCellVoltages();
-        for (int i = 0; i < cells; i++)
-          BmsSetCellVoltage(i, u16be(d + i * 2) / 1000.0f);
+        float sum = 0;
+        for (int i = 0; i < cells; i++) {
+          float v = u16be(d + i * 2) / 1000.0f;
+          BmsSetCellVoltage(i, v);
+          sum += v;
+        }
+        if (sum > 100 && sum < 500)
+          StdMetrics.ms_v_bat_voltage->SetValue(sum);
       }
       break;
     }

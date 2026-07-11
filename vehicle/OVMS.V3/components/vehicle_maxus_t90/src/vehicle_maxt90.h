@@ -31,12 +31,14 @@ protected:
 
 private:
   // Custom metrics:
-  //  - xmt.v.hvac.temp    : HVAC / coolant temperature (°C)
-  //  - xmt.b.capacity     : Nominal pack capacity (kWh)
-  //  - xmt.v.dcdc.voltage : 12V DC-DC output voltage (V)
-  OvmsMetricFloat* m_hvac_temp_c       = nullptr; // xmt.v.hvac.temp
-  OvmsMetricFloat* m_pack_capacity_kwh = nullptr; // xmt.b.capacity
-  OvmsMetricFloat* m_dcdc_voltage      = nullptr; // xmt.v.dcdc.voltage
+  //  - xmt.v.hvac.temp     : HVAC / coolant temperature (°C)
+  //  - xmt.b.capacity      : Nominal pack capacity (kWh)
+  //  - xmt.v.dcdc.voltage  : 12V DC-DC output voltage (V)
+  //  - xmt.b.voltage.limit : BMS computed voltage limit (V), see 0xB105
+  OvmsMetricFloat* m_hvac_temp_c        = nullptr; // xmt.v.hvac.temp
+  OvmsMetricFloat* m_pack_capacity_kwh  = nullptr; // xmt.b.capacity
+  OvmsMetricFloat* m_dcdc_voltage       = nullptr; // xmt.v.dcdc.voltage
+  OvmsMetricFloat* m_batt_voltage_limit = nullptr; // xmt.b.voltage.limit
 
   // Reassembly buffer for poll replies that span several frames
   // (VIN, BMS cell voltage array):
