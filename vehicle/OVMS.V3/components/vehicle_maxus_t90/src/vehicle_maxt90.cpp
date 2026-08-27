@@ -541,9 +541,12 @@ void OvmsVehicleMaxt90::IncomingPollTxCallback(const OvmsPoller::poll_job_t& job
   if (job.moduleid_sent != 0x7e3)   // only the VCU, the one that sleeps
     return;
 
-  if (success)
-    m_vcu_txfail_streak = 0;        // acknowledged: the bus is awake
-  else if (m_vcu_txfail_streak < 255)
+  // Count failures since the last live wake broadcast. Do NOT clear the
+  // count on a successful transmit: while parked, other ECUs on the bus
+  // acknowledge a good fraction of our sends even though the VCU itself is
+  // asleep and never replies, so a "success" here does not mean the car
+  // woke. Only ArmFromDormant() (a real wake broadcast) clears it.
+  if (!success && m_vcu_txfail_streak < 255)
     m_vcu_txfail_streak++;
 }
 

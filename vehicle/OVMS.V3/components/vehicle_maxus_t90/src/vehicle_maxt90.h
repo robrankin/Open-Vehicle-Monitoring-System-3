@@ -87,14 +87,15 @@ private:
   // bus-off and has to be reset. Receiving is unaffected, so the passive
   // broadcasts we rely on for on/charge detection keep arriving.
   //
-  // So we watch the VCU's transmits: once a run of them fail, the VCU is
-  // asleep and we move the poller to state 3, which polls nothing (no poll
-  // list entry sets a state-3 interval, so they all default to 0). We leave
-  // that dormant state as soon as any live broadcast shows the bus is awake
-  // again - which always happens before a charge or drive - and re-probe.
-  uint8_t m_vcu_txfail_streak = 0;    // consecutive failed VCU transmits
+  // So we count the VCU's failed transmits (a bus-ack from another ECU does
+  // not clear the count - only a real wake broadcast does): once enough have
+  // failed the VCU is asleep and we move the poller to state 3, which polls
+  // nothing (no poll list entry sets a state-3 interval, so they default to
+  // 0). We leave that dormant state as soon as any live broadcast shows the
+  // bus is awake again - which always happens before a charge or drive.
+  uint8_t m_vcu_txfail_streak = 0;    // failed VCU transmits since last wake
   bool    m_dormant           = false;
-  static const uint8_t kVcuAsleepThreshold = 3;  // ~15 s at the 5 s state-0 rate
+  static const uint8_t kVcuAsleepThreshold = 5;  // failed sends before dormant
   static const uint8_t kDormantPollState   = 3;  // unused state = polls nothing
 
   // Leave the parked backoff (called when a live broadcast is seen):
