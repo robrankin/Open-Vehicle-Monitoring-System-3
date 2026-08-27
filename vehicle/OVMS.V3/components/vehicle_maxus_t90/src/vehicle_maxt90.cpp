@@ -135,6 +135,7 @@ void OvmsVehicleMaxt90::IncomingFrameCan1(CAN_frame_t* p_frame)
     case 0x266: // Powertrain broadcast, only sent while the car is switched on
     {
       m_on_seen_secs = 5;
+      ArmFromDormant();
       break;
     }
 
@@ -166,12 +167,14 @@ void OvmsVehicleMaxt90::IncomingFrameCan1(CAN_frame_t* p_frame)
       // wakes because a door was opened. The 30 second timeout rides out
       // the gaps in the charging cadence.
       m_carpoll_seen_secs = 30;
+      ArmFromDormant();
       break;
     }
 
     case 0x795: // HV system status broadcast
     {
       HandleCharger795(d, p_frame->FIR.B.DLC);
+      ArmFromDormant();
       break;
     }
 
@@ -524,27 +527,73 @@ void OvmsVehicleMaxt90::SetChargeStopped()
   StdMetrics.ms_v_charge_substate->SetValue("");
 }
 
+// Poll transmit result. success == false means the frame went unacknowledged
+// on the bus. While parked the only poll is the plug detect to the VCU
+// (0x7e3), which is asleep and never acks, so those failures are what drive
+// the bus toward a bus-off reset. Count consecutive VCU failures; the state
+// machine in PollerStateTicker acts on the count. This runs in the CAN task,
+// so it stays trivial.
+void OvmsVehicleMaxt90::IncomingPollTxCallback(const OvmsPoller::poll_job_t& job,
+                                               bool success)
+{
+  OvmsVehicleOBDII::IncomingPollTxCallback(job, success);
+
+  if (job.moduleid_sent != 0x7e3)   // only the VCU, the one that sleeps
+    return;
+
+  if (success)
+    m_vcu_txfail_streak = 0;        // acknowledged: the bus is awake
+  else if (m_vcu_txfail_streak < 255)
+    m_vcu_txfail_streak++;
+}
+
+// A live broadcast means the bus is awake again, so leave the parked backoff
+// and let the poller resume (plug detect, then charge detection):
+void OvmsVehicleMaxt90::ArmFromDormant()
+{
+  if (m_dormant) {
+    ESP_LOGI(TAG, "Bus activity seen - resuming the poller");
+    m_dormant = false;
+  }
+  m_vcu_txfail_streak = 0;
+}
+
 // The framework calls this once a second, just before the next poll is
 // sent. It's the only place the poll state changes, so the charge and
 // ready signals can't fight over it:
-//   charging -> 2,  ready (on) -> 1,  otherwise -> 0
+//   charging -> 2,  ready (on) -> 1,  parked+VCU asleep -> 3 (no polls),
+//   otherwise -> 0
 void OvmsVehicleMaxt90::PollerStateTicker(canbus* bus)
 {
   bool charging = StdMetrics.ms_v_charge_inprogress->AsBool();
+  bool on       = StdMetrics.ms_v_env_on->AsBool();
+
+  // Parked and the VCU has stopped acking our plug-detect poll: it's asleep.
+  // Stop polling it (state 3 polls nothing) so we don't keep failing
+  // transmits into it. A live broadcast re-arms us via ArmFromDormant().
+  if (!m_dormant && !on && !charging &&
+      m_vcu_txfail_streak >= kVcuAsleepThreshold) {
+    ESP_LOGI(TAG, "VCU unreachable (%u failed transmits) - parking the poller",
+             m_vcu_txfail_streak);
+    m_dormant = true;
+  }
 
   uint8_t want;
   if (charging)
     want = 2;
-  else if (StdMetrics.ms_v_env_on->AsBool())
+  else if (on)
     want = 1;
+  else if (m_dormant)
+    want = kDormantPollState;   // 3: transmit nothing while the car sleeps
   else
     want = 0;
 
   if (m_poll_state != want) {
-    ESP_LOGI(TAG, "Poll state %d -> %d (charge=%s on=%s)",
+    ESP_LOGI(TAG, "Poll state %d -> %d (charge=%s on=%s dormant=%s)",
              m_poll_state, want,
              charging ? "true" : "false",
-             StdMetrics.ms_v_env_on->AsBool() ? "true" : "false");
+             on ? "true" : "false",
+             m_dormant ? "true" : "false");
     PollSetState(want);
   }
 }

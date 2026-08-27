@@ -17,6 +17,13 @@ protected:
   void IncomingPollReply(const OvmsPoller::poll_job_t& job,
                          uint8_t* data, uint8_t length) override;
 
+  // OBDII poll transmit result. The framework calls this on every poll TX,
+  // with success == false when the frame was not acknowledged on the bus.
+  // We use it to notice the VCU going unreachable while parked (see the
+  // parked-backoff note below):
+  void IncomingPollTxCallback(const OvmsPoller::poll_job_t& job,
+                              bool success) override;
+
   // Raw CAN1 frames (lock status on 0x281, odometer on 0x540,
   // HV system status on 0x795, etc.):
   void IncomingFrameCan1(CAN_frame_t* p_frame) override;
@@ -70,6 +77,28 @@ private:
   // Seconds since the charge started. Used to settle on "ccs" as the charge
   // type when the on-board charger never reports any AC current:
   int m_charge_secs = 0;
+
+  // Parked no-poll backoff.
+  //
+  // The only poll that runs while parked (poll state 0) is the plug detect
+  // to the VCU (0x7e3). While the car is off the VCU is asleep and never
+  // acknowledges, so every one of those transmits is a CAN "no-ack" error
+  // that pushes the transmit error counter up until the bus trips to
+  // bus-off and has to be reset. Receiving is unaffected, so the passive
+  // broadcasts we rely on for on/charge detection keep arriving.
+  //
+  // So we watch the VCU's transmits: once a run of them fail, the VCU is
+  // asleep and we move the poller to state 3, which polls nothing (no poll
+  // list entry sets a state-3 interval, so they all default to 0). We leave
+  // that dormant state as soon as any live broadcast shows the bus is awake
+  // again - which always happens before a charge or drive - and re-probe.
+  uint8_t m_vcu_txfail_streak = 0;    // consecutive failed VCU transmits
+  bool    m_dormant           = false;
+  static const uint8_t kVcuAsleepThreshold = 3;  // ~15 s at the 5 s state-0 rate
+  static const uint8_t kDormantPollState   = 3;  // unused state = polls nothing
+
+  // Leave the parked backoff (called when a live broadcast is seen):
+  void ArmFromDormant();
 
   // Charge status handlers / helpers:
   void HandleCharger795(const uint8_t* d, uint8_t length);
