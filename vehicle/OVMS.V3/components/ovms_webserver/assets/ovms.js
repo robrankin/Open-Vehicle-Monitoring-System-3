@@ -478,6 +478,8 @@ var unit_conversions = {
       "mipkwh>kmpkwh":      mi_to_km,
       "celcius>fahrenheit": function (value) { return ((value*9)/5) + 32; },
       "fahrenheit>celcius": function (value) { return ((value-32)*5)/9; },
+      "celciusdiff>fahrenheitdiff": function (value) { return (value*9)/5; },
+      "fahrenheitdiff>celciusdiff": function (value) { return (value*5)/9; },
       "kpa>pa":             kx_to_x,
       "kpa>bar":            function (value) { return value/100; },
       "kpa>psi":            function (value) { return value * 0.14503773773020923; },
@@ -531,7 +533,9 @@ units.convertMetricToUserUnits = function (value, name) {
     cnvfn = convertUnitFunction(unit_entry.native, unit_entry.code);
     this.metrics[name].user_fn = cnvfn;
   }
-  return cnvfn(value);
+  // Vector metrics (e.g. v.b.c.temp) arrive as arrays; the scalar conversion
+  // functions return NaN for an array, so convert element-wise (issue #1426).
+  return Array.isArray(value) ? value.map(function (v) { return cnvfn(v); }) : cnvfn(value);
 }
 units.userUnitLabelFromMetric = function (name) {
     var unit_entry = this.metrics[name];

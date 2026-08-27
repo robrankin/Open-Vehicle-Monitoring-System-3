@@ -38,6 +38,10 @@ OvmsVehicleVWeGolf::OvmsVehicleVWeGolf() {
     // init configs:
     MyConfig.RegisterParam("xvg", "VW e-Golf", true, true);
 
+    // Regenerative-braking strength (numeric, cheap to transmit). Decoded from the
+    // gear-selector frame 0x187 in IncomingFrameCan2. -1 until first seen in D/B.
+    m_recup_level = MyMetrics.InitInt("xvg.v.recup", SM_STALE_MIN, -1);
+
     // KCAN (CAN3) carries comfort, body, and clima frames via the J533 gateway.
     // FCAN (CAN2) is the powertrain bus (BMS, motor controller, VIN).
     // CAN1 (OBD) is diagnostic-only and inaccessible while the car is asleep.
@@ -50,9 +54,13 @@ OvmsVehicleVWeGolf::OvmsVehicleVWeGolf() {
     RegisterCanBus(2, CAN_MODE_LISTEN, CAN_SPEED_500KBPS);  // FCAN — powertrain (read-only)
     RegisterCanBus(3, CAN_MODE_ACTIVE, CAN_SPEED_500KBPS);  // KCAN — comfort / clima
 
+    // The climate controller drives the BCU over the KCAN (comfort) bus.
+    m_batctrl.SetBus(m_can3);
+
     OvmsCommand* cmd_vweg = MyCommandApp.RegisterCommand("xvg", "VW e-Golf controls");
-    cmd_vweg->RegisterCommand("offline", "Stop sending OCU keepalive", [this](...) {
-        m_is_control_active = false;
+    cmd_vweg->RegisterCommand("offline", "Stop sending OCU keepalive (diagnostic)", [this](...) {
+        m_ocu_active = false;
+        m_batctrl.Abort();  // also release any in-flight climate NM-wake bridge
         ESP_LOGI(TAG, "OCU keepalive stopped");
     });
     cmd_vweg->RegisterCommand("fold_mirrors", "Fold mirrors in",
@@ -79,27 +87,46 @@ void OvmsVehicleVWeGolf::IncomingFrameCan2(CAN_frame_t* p_frame) {
         case 0x187: {
             const uint8_t gear_nibble = p_frame->data.u8[2] & 0x0F;
             ESP_LOGV(TAG, "0x187 gear nibble=%d", gear_nibble);
+            // Drive mode (Normal/Eco/Eco+) is NOT derived here — B is a gear/regen
+            // selection, not a Charisma drive profile. ms_v_env_drivemode is set from
+            // the Charisma active profile in frame 0x386 (IncomingFrameCan3).
             if (gear_nibble == 2) {
                 // Park
                 StandardMetrics.ms_v_env_gear->SetValue(0);
-                StandardMetrics.ms_v_env_drivemode->SetValue(0);
             } else if (gear_nibble == 3) {
                 // Reverse
                 StandardMetrics.ms_v_env_gear->SetValue(-1);
-                StandardMetrics.ms_v_env_drivemode->SetValue(0);
             } else if (gear_nibble == 4) {
                 // Neutral
                 StandardMetrics.ms_v_env_gear->SetValue(0);
-                StandardMetrics.ms_v_env_drivemode->SetValue(0);
             } else if (gear_nibble == 5) {
                 // Drive
                 StandardMetrics.ms_v_env_gear->SetValue(1);
-                StandardMetrics.ms_v_env_drivemode->SetValue(0);
             } else if (gear_nibble == 6) {
                 // B mode
                 StandardMetrics.ms_v_env_gear->SetValue(1);
-                StandardMetrics.ms_v_env_drivemode->SetValue(1);
             }
+
+            // Regenerative-braking (recuperation) strength. The e-Golf has five
+            // regen levels: D0 (coast, no regen), D1, D2, D3, and B (max). D0..D3
+            // are selected with the paddles while in gear D; B is its own gear.
+            // Exposed as a 0..4 strength (least->most) on xvg.v.recup.
+            //
+            // State is in this frame's d[1] high nibble; the top bit is always set
+            // in operation, so mask it off (rc = low 3 bits). In gear D:
+            //   0 = D0 coast (just shifted into D, no stage selected)
+            //   1 = D1, 2 = D2, 3 = D3  (paddle regen stages)
+            //   5 = D0 with recuperation switched off by the driver (also coast)
+            // In gear B rc reads 0, but the gear itself means max regen.
+            const uint8_t rc = (p_frame->data.u8[1] >> 4) & 0x7;
+            int recup = -1;                                 // N/A unless in D or B
+            if (gear_nibble == 6) {
+                recup = 4;                                  // B — max regen
+            } else if (gear_nibble == 5) {
+                recup = (rc >= 1 && rc <= 3) ? rc : 0;      // D1/D2/D3, else D0 (coast)
+            }
+            m_recup_level->SetValue(recup);
+            ESP_LOGV(TAG, "0x187 gear=%u rc=%u recup=%d", gear_nibble, rc, recup);
             break;
         }
         case 0x6B4: {
@@ -132,26 +159,32 @@ void OvmsVehicleVWeGolf::IncomingFrameCan2(CAN_frame_t* p_frame) {
             break;
         }
     }
-    // J533 bridges KCAN traffic onto CAN2; forward every frame so the KCAN
-    // decoder in IncomingFrameCan3 can process it regardless of which bus it arrives on.
-    IncomingFrameCan3(p_frame);
 }
 
 void OvmsVehicleVWeGolf::IncomingFrameCan3(CAN_frame_t* p_frame) {
-    m_last_message_received = 0;
+    m_bus_idle_ticks = 0;
+
+    // Send OCU keepalive at ~5Hz while active. VW OSEK NM requires keepalives at
+    // ~200ms intervals; Ticker1 alone (1Hz) is too slow for the ECU to stay in network.
+    // SendOcuHeartbeat self-throttles (180ms min) against TX queue overflow on bus bursts.
+    if (m_ocu_active) {
+        SendOcuHeartbeat();
+    }
+
     uint8_t* d = p_frame->data.u8;
+
+    // Track OEM OCU activity: any non-zero 0x5A7 means the car's OCU is still active.
+    // Reset the idle counter so we don't wake while it would conflict with our heartbeat.
+    if (p_frame->MsgID == 0x5A7) {
+        if (d[0] | d[1] | d[2] | d[3] | d[4] | d[5] | d[6] | d[7]) {
+            m_oem_ocu_idle_ticks = 0;
+        }
+    }
 
     uint8_t tmp_u8 = 0;
     uint16_t tmp_u16 = 0;
     uint32_t tmp_u32 = 0;
-    // int8_t tmp_i8 = 0;
-    // int16_t tmp_i16 = 0;
-    // int32_t tmp_i32 = 0;
     float tmp_f32 = 0.0F;
-
-    // //TODO Debug only doesn't work ECU timeout
-    // vTaskDelay(pdMS_TO_TICKS(500)); //500ms wait.. hopefully my log isn't get messed up
-    // //TODO end doesn't work ECU timeout
 
     switch (p_frame->MsgID) {
         // TODO: Need to move to verify
@@ -176,9 +209,11 @@ void OvmsVehicleVWeGolf::IncomingFrameCan3(CAN_frame_t* p_frame) {
             // Startup sentinel: d[2]=0xFF decodes to I=2047 A and V=1023.5 V. Discard it.
             if (d[2] == 0xFF) break;
 
-            // Current: 12-bit, factor 1 A, offset -2047 A.
+            // Current: 12-bit, factor 1 A. The raw field is charge-positive; negate to
+            // the OVMS convention (ms_v_bat_current is output=positive, i.e. discharge
+            // positive / charge negative): I = 2047 - raw.
             tmp_u16 = ((uint16_t)(d[1] & 0xf0) >> 4) | ((uint16_t)(d[2]) << 4);
-            tmp_f32 = ((float)tmp_u16) * 1.0F - 2047.0F;
+            tmp_f32 = 2047.0F - (float)tmp_u16;
             StandardMetrics.ms_v_bat_current->SetValue(tmp_f32);
 
             // Voltage: 12-bit, factor 0.25 V.
@@ -186,9 +221,11 @@ void OvmsVehicleVWeGolf::IncomingFrameCan3(CAN_frame_t* p_frame) {
             tmp_f32 = ((float)tmp_u16) * 0.25F;
             StandardMetrics.ms_v_bat_voltage->SetValue(tmp_f32);
 
-            // Power: negative = charging, positive = driving.
-            tmp_f32 = -1.0F * (StandardMetrics.ms_v_bat_voltage->AsFloat() *
-                               StandardMetrics.ms_v_bat_current->AsFloat()) / 1000.0F;
+            // Power = V * I, following the output=positive current sign above
+            // (ms_v_bat_power is output=positive: positive = driving, negative = charging).
+            tmp_f32 = (StandardMetrics.ms_v_bat_voltage->AsFloat() *
+                       StandardMetrics.ms_v_bat_current->AsFloat()) /
+                      1000.0F;
             StandardMetrics.ms_v_bat_power->SetValue(tmp_f32);
             ESP_LOGV(TAG, "0x0191 I=%.1fA V=%.2fV", StandardMetrics.ms_v_bat_current->AsFloat(),
                      StandardMetrics.ms_v_bat_voltage->AsFloat());
@@ -240,8 +277,8 @@ void OvmsVehicleVWeGolf::IncomingFrameCan3(CAN_frame_t* p_frame) {
             // Sign bits: bit 55 (d[6] MSB) = Southern hemisphere, bit 56 (d[7] bit 0) = Western.
             // Confirmed consistent with known N/E location. S/W hemisphere still needs a capture.
             // Sentinel frames (all 0xFF) decode to lat=134°/lon=268° — filter by range.
-            tmp_u32 = ((uint32_t)(d[0])) | ((uint32_t)(d[1]) << 8) |
-                      ((uint32_t)(d[2]) << 16) | ((uint32_t)(d[3] & 0x7) << 24);
+            tmp_u32 = ((uint32_t)(d[0])) | ((uint32_t)(d[1]) << 8) | ((uint32_t)(d[2]) << 16) |
+                      ((uint32_t)(d[3] & 0x7) << 24);
             float lat = ((float)tmp_u32) * 0.000001F;
             if ((d[6] >> 7) & 1) lat = -lat;  // Southern hemisphere
 
@@ -259,6 +296,30 @@ void OvmsVehicleVWeGolf::IncomingFrameCan3(CAN_frame_t* p_frame) {
             ESP_LOGV(TAG, "0x0486 lat=%.6f lon=%.6f valid=%d", lat, lon, valid);
             break;
         }
+        case 0x386:  // Drive mode (Charisma / Fahrprofilauswahl active profile).
+        {
+            // d[5] = active drive profile: 0x02 = Normal, 0x05 = Eco, 0x08 = Eco+
+            // (matches the MIB CharismaProfiles enum auto_normal=2/efficiency=5/range=8).
+            // Mapped to ms_v_env_drivemode as 1 = Normal, 2 = Eco, 3 = Eco+, matching the
+            // sibling VW e-Up module's v.e.drivemode encoding (1=STD, 2=ECO, 3=ECO+).
+            switch (d[5]) {
+                case 0x02:
+                    StandardMetrics.ms_v_env_drivemode->SetValue(1);
+                    break;
+                case 0x05:
+                    StandardMetrics.ms_v_env_drivemode->SetValue(2);
+                    break;
+                case 0x08:
+                    StandardMetrics.ms_v_env_drivemode->SetValue(3);
+                    break;
+                default:
+                    // Unknown profile value (0x00 = inactive when not drivable) — leave
+                    // the last known drive mode.
+                    break;
+            }
+            ESP_LOGV(TAG, "0x0386 drivemode raw=0x%02x", d[5]);
+            break;
+        }
         case 0x583:  // ZV_02: central locking and door open states.
         {
             // d[2] bit 1: locked externally. d[3] bits 4:0: trunk, rr, rl, fr, fl (1=open).
@@ -268,9 +329,9 @@ void OvmsVehicleVWeGolf::IncomingFrameCan3(CAN_frame_t* p_frame) {
             StdMetrics.ms_v_door_rl->SetValue((d[3] & 0x4) >> 2);
             StdMetrics.ms_v_door_rr->SetValue((d[3] & 0x8) >> 3);
             StdMetrics.ms_v_door_trunk->SetValue((d[3] & 0x10) >> 4);
-            ESP_LOGV(TAG, "0x0583 locked=%u fl=%u fr=%u rl=%u rr=%u trunk=%u",
-                     (d[2] & 0x2) >> 1, d[3] & 0x1, (d[3] & 0x2) >> 1,
-                     (d[3] & 0x4) >> 2, (d[3] & 0x8) >> 3, (d[3] & 0x10) >> 4);
+            ESP_LOGV(TAG, "0x0583 locked=%u fl=%u fr=%u rl=%u rr=%u trunk=%u", (d[2] & 0x2) >> 1,
+                     d[3] & 0x1, (d[3] & 0x2) >> 1, (d[3] & 0x4) >> 2, (d[3] & 0x8) >> 3,
+                     (d[3] & 0x10) >> 4);
             break;
         }
         case 0x594:  // HV charge management
@@ -305,8 +366,10 @@ void OvmsVehicleVWeGolf::IncomingFrameCan3(CAN_frame_t* p_frame) {
                         StandardMetrics.ms_v_bat_voltage->AsFloat());
                 }
                 if (is_charging != was_charging) {
-                    if (is_charging) NotifyChargeStart();
-                    else NotifyChargeStopped();
+                    if (is_charging)
+                        NotifyChargeStart();
+                    else
+                        NotifyChargeStopped();
                 }
             }
 
@@ -537,19 +600,20 @@ void OvmsVehicleVWeGolf::IncomingFrameCan3(CAN_frame_t* p_frame) {
             ESP_LOGV(TAG, "0x05CA bat_capacity=%.1f kWh", tmp_f32);
             break;
         }
-        case 0x5EA:  // Clima ECU status: cabin temperature and remote mode.
+        case 0x5EA:  // Clima ECU status: cabin temperature and HVAC conditioning bit.
         {
+            // HVAC conditioning state (d[3] bit 3) is owned by the climate controller;
+            // forward it there. Done before the cabin-temp sentinel guard so HVAC always
+            // tracks even when the temperature reads the startup sentinel.
+            m_batctrl.IncomingClimaEcuStatus(p_frame);
+
             // Cabin temperature: 10-bit, factor 0.1°C, offset -40°C.
             // Near-max raw value is a startup sentinel decoding to ~62°C. Discard it.
             tmp_u16 = ((uint16_t)(d[6] & 0xfc) >> 2) | ((uint16_t)(d[7] & 0xf) << 6);
             if (tmp_u16 >= 0x3FE) break;
             tmp_f32 = ((float)tmp_u16) * 0.1F - 40.0F;
-
-            // remote_mode: 0=idle, 2=running, 3=just activated. HVAC on when != 0.
-            tmp_u8 = ((uint8_t)(d[3] & 0xc0) >> 6) | ((uint8_t)(d[4] & 0x1) << 2);
-            StandardMetrics.ms_v_env_hvac->SetValue(tmp_u8 != 0);
             StandardMetrics.ms_v_env_cabintemp->SetValue(tmp_f32);
-            ESP_LOGV(TAG, "0x05EA clima_cabin=%.1f°C remote_mode=%u", tmp_f32, tmp_u8);
+            ESP_LOGV(TAG, "0x05EA clima_cabin=%.1f°C d3=%02x", tmp_f32, d[3]);
             break;
         }
         case 0x5F5:  // Range estimates from the instrument cluster.
@@ -608,11 +672,14 @@ void OvmsVehicleVWeGolf::IncomingFrameCan3(CAN_frame_t* p_frame) {
 
             // Park time: 17-bit field at bit offset 20, factor 1 s.
             // d[2] bits [7:4] → result bits [3:0], d[3] → [11:4], d[4] bits [4:0] → [16:12].
-            tmp_u32 =
-                ((uint32_t)(d[2] & 0xf0) >> 4) | ((uint32_t)(d[3]) << 4) |
-                ((uint32_t)(d[4] & 0x1f) << 12);
-            StandardMetrics.ms_v_env_parktime->SetValue(tmp_u32);
-            ESP_LOGV(TAG, "0x06B7 parktime=%u", tmp_u32);
+            // The field saturates at its 17-bit max (0x1FFFF ≈ 36.5 h); ignore that
+            // clamped value so v.e.parktime falls back to OVMS's native (uncapped) counter.
+            tmp_u32 = ((uint32_t)(d[2] & 0xf0) >> 4) | ((uint32_t)(d[3]) << 4) |
+                      ((uint32_t)(d[4] & 0x1f) << 12);
+            if (tmp_u32 != 0x1FFFF) {
+                StandardMetrics.ms_v_env_parktime->SetValue(tmp_u32);
+                ESP_LOGV(TAG, "0x06B7 parktime=%u", tmp_u32);
+            }
 
             tmp_u8 = ((uint8_t)(d[7] & 0xff) << 0) |
                      0;  // outerTemp Faktor 0.5 Offset -50, Minimum -50, Maximum 75 [°C] Initial 77
@@ -620,6 +687,20 @@ void OvmsVehicleVWeGolf::IncomingFrameCan3(CAN_frame_t* p_frame) {
             tmp_f32 = ((float)tmp_u8) * 0.5F - 50.0F;
             StandardMetrics.ms_v_env_temp->SetValue(tmp_f32);  // working
             ESP_LOGV(TAG, "0x06B7 outside=%.1f°C", tmp_f32);
+            break;
+        }
+        case 0x391:  // OBD_01: drivetrain READY status
+        {
+            // d[7] bit 5 is OBD_Driving_Cycle: it goes high only once the drivetrain is fully
+            // up and the car is ready to drive; it stays clear during charging, remote climate
+            // and while the ignition is merely on but not yet READY. The frame keeps
+            // broadcasting after the ignition goes off and the bit stays latched high for
+            // several seconds into the power-down, so it is combined with KL_15 for v.e.on
+            // rather than used on its own. if only ignition is turned on again this bit is cleared.
+            // (d[5] carries the accelerator pedal position, OBD_Abs_Pedal_Pos - not mapped.)
+            m_drivetrain_ready = (d[7] & 0x20) != 0;
+            StandardMetrics.ms_v_env_on->SetValue(m_kl15_on && m_drivetrain_ready);
+            ESP_LOGV(TAG, "0x391 READY=%u", m_drivetrain_ready);
             break;
         }
         case 0x3C0:  // clamp status received
@@ -633,6 +714,19 @@ void OvmsVehicleVWeGolf::IncomingFrameCan3(CAN_frame_t* p_frame) {
             // KL_Infotainment Faktor 1 Offset 0, Minimum 0, Maximum 1 [] Initial 0
             // Remotestart_KL15_Anf Faktor 1 Offset 0, Minimum 0, Maximum 1 [] Initial 0
             // Remotestart_Motor_Start Faktor 1 Offset 0, Minimum 0, Maximum 1 [] Initial 0
+            // KL_15 (terminal 15 = ignition) means the car is awake and switched on by the
+            // user; drivable (v.e.on) additionally requires the drivetrain to report READY.
+            m_kl15_on = (d[2] & 0x02) != 0;
+            StandardMetrics.ms_v_env_awake->SetValue(m_kl15_on);
+            StandardMetrics.ms_v_env_on->SetValue(m_kl15_on && m_drivetrain_ready);
+            ESP_LOGV(TAG, "0x3C0 KL_15=%u KL_S=%u", m_kl15_on, d[2] & 0x01);
+            break;
+        }
+        case 0x17332510: {
+            // BatteryControl (BCU, node 0x25) BAP status stream, extended 29-bit frame.
+            // The climate controller reassembles it and reads the authoritative HVAC state
+            // and command confirmation from the OperationMode echo ("49 58 <flag>").
+            m_batctrl.IncomingBapStatus(p_frame);
             break;
         }
         default: {
@@ -646,33 +740,81 @@ void OvmsVehicleVWeGolf::IncomingFrameCan3(CAN_frame_t* p_frame) {
     }
 }
 
-// ms_v_env_awake;                     // Vehicle is fully awake (switched on by the user)
-// ms_v_env_on;                        // Vehicle is in "ignition" state (drivable)
-
-// 0x12dd546f BCM_04... ansteuerung LED Ladeanzeige mit Dimmung und Farbe?
-
-// 0x5B0 => TimeDate
+// ---------------------------------------------------------------------------
+// Periodic tickers
+// ---------------------------------------------------------------------------
 
 void OvmsVehicleVWeGolf::Ticker1(uint32_t ticker) {
-    // 10 seconds after last received message we assume that the car is sleeping
-    m_is_car_online = m_last_message_received < 10;
+    OvmsVehicle::Ticker1(ticker);
 
-    if (m_last_message_received < 254) m_last_message_received++;
-    ESP_LOGV(TAG, "0x5A7 last_msg=%u", m_last_message_received);
+    // Count consecutive seconds of KCAN silence. IncomingFrameCan3 resets this to 0
+    // whenever a frame arrives, so it measures how long since the last activity.
+    if (m_bus_idle_ticks < 254) m_bus_idle_ticks++;
+    if (m_oem_ocu_idle_ticks < 254) m_oem_ocu_idle_ticks++;
 
-    if (m_is_control_active &&
-        m_is_car_online)  // after wakeup the other ECUs waiting for the car to be online before we
-                          // send some Heartbeat messages otherwise we have some serious txerrors
-                          // just before the car ist active
-    {
-        SendOcuHeartbeat();  // working
-        ESP_LOGV(TAG, "Heartbeat sending triggered");
+    bool bus_alive = m_bus_idle_ticks < VWEGOLF_BUS_TIMEOUT_SECS;
+    bool just_went_idle = (m_bus_idle_ticks == VWEGOLF_BUS_TIMEOUT_SECS);
+    ESP_LOGV(TAG, "Ticker1: bus_idle=%u alive=%d ocu=%d", m_bus_idle_ticks, bus_alive,
+             m_ocu_active);
+
+    // When the bus goes silent the car is asleep: clear the awake / drivable state as a
+    // backstop in case the terminal frames stopped before signalling the off transition.
+    if (!bus_alive) {
+        m_kl15_on = false;
+        m_drivetrain_ready = false;
+        StandardMetrics.ms_v_env_awake->SetValue(false);
+        StandardMetrics.ms_v_env_on->SetValue(false);
+        // Regen level (xvg.v.recup) is a driving concept — clear it to N/A once the
+        // car is off/asleep so it doesn't linger on the last D/B value (the gear
+        // frame 0x187 stops broadcasting when the car sleeps).
+        m_recup_level->SetValue(-1);
     }
+
+    // Clear OCU node presence on either condition:
+    //   1. Bus went idle (no frames for VWEGOLF_BUS_TIMEOUT_SECS) — no one to hear us.
+    //   2. OEM OCU is present — it owns 0x5A7, our TX would collide on arbitration.
+    // Without (2), m_ocu_active stays set across an entire drive cycle whenever the
+    // bus never idles, and the next RX frame triggers a heartbeat that collides with
+    // the OEM OCU every time. Do NOT clear metrics — decoders own them; stale-expire
+    // handles freshness. (Clearing charge_inprogress here would falsely show "not
+    // charging" during CCS DC, which keeps KCAN silent while actively charging.)
+    bool oem_ocu_present = m_oem_ocu_idle_ticks < VWEGOLF_BUS_TIMEOUT_SECS;
+
+    if (m_ocu_active) {
+        if (m_ocu_session_secs < 255) m_ocu_session_secs++;
+        if (m_ocu_grace_secs < 255) m_ocu_grace_secs++;
+    }
+    bool grace_expired = m_ocu_grace_secs < 255 && m_ocu_grace_secs >= VWEGOLF_OCU_ACK_GRACE_SECS;
+    bool cap_expired = m_ocu_session_secs >= VWEGOLF_OCU_SESSION_CAP_SECS;
+
+    if (m_ocu_active && (just_went_idle || oem_ocu_present || grace_expired || cap_expired)) {
+        m_ocu_active = false;
+        const char* reason = just_went_idle    ? "KCAN idle"
+                             : oem_ocu_present ? "OEM OCU active"
+                             : grace_expired   ? "ACK grace expired"
+                                               : "session cap";
+        ESP_LOGI(TAG, "OCU presence cleared: %s", reason);
+    }
+
+    // Guard: only heartbeat when we've joined the bus and the bus has live traffic.
+    if (m_ocu_active && bus_alive) {
+        SendNmAlive();
+        SendOcuHeartbeat();
+    }
+
+    // Drive the climate controller's wake + retry-until-confirmed state machine. It is
+    // self-contained (spare-node NM wake on KCAN, independent of the OCU heartbeat above)
+    // and owns ms_v_env_hvac, including clearing it when the bus sleeps.
+    m_batctrl.Ticker1(bus_alive);
 }
+
+// ---------------------------------------------------------------------------
+// Vehicle commands
+// ---------------------------------------------------------------------------
 
 OvmsVehicle::vehicle_command_t OvmsVehicleVWeGolf::CommandLock(const char* pin) {
     if (!PinCheck(pin)) {
-        ESP_LOGW(TAG, "PinCheck failed in CommandLock");
+        ESP_LOGW(TAG, "CommandLock: PIN check failed");
         return Fail;
     }
     m_lock_requested = true;
@@ -681,7 +823,7 @@ OvmsVehicle::vehicle_command_t OvmsVehicleVWeGolf::CommandLock(const char* pin) 
 
 OvmsVehicle::vehicle_command_t OvmsVehicleVWeGolf::CommandUnlock(const char* pin) {
     if (!PinCheck(pin)) {
-        ESP_LOGW(TAG, "PinCheck failed in CommandUnlock");
+        ESP_LOGW(TAG, "CommandUnlock: PIN check failed");
         return Fail;
     }
     m_unlock_requested = true;
@@ -704,96 +846,72 @@ OvmsVehicle::vehicle_command_t OvmsVehicleVWeGolf::CommandIndicators() {
 }
 
 OvmsVehicle::vehicle_command_t OvmsVehicleVWeGolf::CommandPanic() {
-    m_panic_mode_requested = true;
+    m_panic_requested = true;
     return Success;
 }
 
-void OvmsVehicleVWeGolf::Ticker10(uint32_t ticker) {
-    // working
-    m_climate_control_temp = MyConfig.GetParamValueInt("xvg", "cc_temp", 21);
-    m_climate_control_on_battery = (MyConfig.GetParamValueBool("xvg", "cc_onbat", false) ? 1 : 0);
+void OvmsVehicleVWeGolf::WakeKcanBus() {
+    ESP_LOGI(TAG, "WakeKcanBus: asserting dominant bits on KCAN");
 
-    ESP_LOGV(TAG,
-             "Trigger10 cc_temp: %u °C, cc_onbat: %u, control_mirror %u, control_horn: %u, "
-             "control_indicator: %u, control_panicMode: %u, control_unlock %u, control_lock %u",
-             m_climate_control_temp, m_climate_control_on_battery, m_mirror_fold_in_requested,
-             m_horn_requested, m_indicators_requested, m_panic_mode_requested, m_unlock_requested,
-             m_lock_requested);
+    // Reset the KCAN controller to clear any stuck frame from the TWAI HW TX FIFO.
+    // A stale heartbeat left from the prior session occupies the FIFO slot; on a sleeping
+    // bus it can never drain (no ACK), so the wake frame queues behind it and never
+    // produces dominant bits. Stop/Start preserves mode and speed.
+    m_can3->Reset();
+    vTaskDelay(pdMS_TO_TICKS(5));
+
+    uint8_t data[8] = {0x40, 0x00, 0x01, 0x1F, 0x00, 0x00, 0x00, 0x00};
+    m_can3->WriteExtended(0x17330301, 8, data, pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    data[0] = 0x67;
+    data[1] = 0x10;
+    data[2] = 0x41;
+    data[3] = 0x84;
+    data[4] = 0x14;
+    data[5] = 0x00;
+    data[6] = 0x00;
+    data[7] = 0x00;
+    m_can3->WriteExtended(0x1B000067, 8, data, pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    m_ocu_active = true;
+    m_ocu_session_secs = 0;
+    m_ocu_grace_secs = 255;
 }
 
 OvmsVehicle::vehicle_command_t OvmsVehicleVWeGolf::CommandWakeup() {
-    ESP_LOGV(TAG, "Wakeup triggered");
-
-    // Info: eGolf300 after sending only the heartbeat message ID:0x5A7 or the first message here
-    // ID:0x17330301 one ECU with ID:0x5F5 is answering on the bus perhaps ID:0x66E and ID:0x6B5 too
-    // Info: perhaps this could be used for another method to wakeup the car comf CAN perhaps
-    // changing the settings is possible without weaking up everything
-
-    if (!m_is_car_online) {
-        ESP_LOGI(TAG, "Car is sleeping we are trying to wake it up");
-        // Wake up the Bus //CLI: can can3 tx extended 0x17330301 0x40 0x00 0x01 0x1F 0x00 0x00 0x00
-        // 0x00
-        canbus* comfBus;
-        comfBus = m_can3;
-        uint8_t length = 8;
-        uint8_t data[length];
-        data[0] = 0x40;
-        data[1] = 0x00;
-        data[2] = 0x01;
-        data[3] = 0x1F;
-        data[4] = 0x00;
-        data[5] = 0x00;
-        data[6] = 0x00;
-        data[7] = 0x00;
-        comfBus->WriteExtended(0x17330301, length, data);
-        vTaskDelay(pdMS_TO_TICKS(50));
-        ESP_LOGV(TAG, "First message send ID: data 0->7");
-        ESP_LOGV(TAG,
-                 "First message send ID:0x17330301 data %02x %02x %02x %02x %02x %02x %02x %02x",
-                 data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
-
-        vTaskDelay(pdMS_TO_TICKS(100));
-        length = 8;
-        data[0] = 0x67;  // source node identifier identity of the transmitter of the message
-        data[1] = 0x10;  // could be anything
-        data[2] = 0x41;  // 0-5 => State,  6 => eCall Car Wakeup
-        data[3] = 0x84;  // 0-8 => eCall Wakeup
-        data[4] = 0x14;
-        data[5] = 0x00;
-        data[6] = 0x00;
-        data[7] = 0x00;
-        comfBus->WriteExtended(0x1B000067, length, data);
-        vTaskDelay(pdMS_TO_TICKS(50));
-        ESP_LOGV(TAG, "second message send ID: data 0->7");
-        ESP_LOGV(TAG,
-                 "second message send ID:0x1B000067 data %02x %02x %02x %02x %02x %02x %02x %02x",
-                 data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
-
-        m_is_control_active = true;
-    } else {
-        ESP_LOGI(TAG, "Wakeup not necessary car was online before");
+    if (m_bus_idle_ticks < VWEGOLF_BUS_TIMEOUT_SECS) {
+        ESP_LOGI(TAG, "Wakeup: KCAN already active");
+        return Success;
     }
+    WakeKcanBus();
     return Success;
 }
 
 void OvmsVehicleVWeGolf::SendOcuHeartbeat() {
+    // Hard gate: OEM OCU owns 0x5A7. If it's alive, our TX collides on arbitration
+    // every frame (identical ID) — TEC climbs on no-ACK until bus-off. Stand down
+    // until the OEM OCU has been silent for >= VWEGOLF_BUS_TIMEOUT_SECS.
+    if (m_oem_ocu_idle_ticks < VWEGOLF_BUS_TIMEOUT_SECS) {
+        return;
+    }
+
+    // Self-throttle: minimum 180 ms between sends regardless of caller (Ticker1,
+    // incoming-frame hook, or any future call site). Guards against TX queue overflow
+    // during NM wake bursts and ensures Ticker1 can't double-fire on top of the
+    // incoming-frame path.
+    uint32_t now = xTaskGetTickCount();
+    if ((now - m_last_heartbeat_tick) * portTICK_PERIOD_MS < 180) {
+        return;
+    }
+    m_last_heartbeat_tick = now;
+
     uint8_t tmp_u8 = 0;
 
-    canbus* comfBus;
-    comfBus = m_can3;
-    uint8_t length = 8;
-    uint8_t data[length];
-    length = 8;
-    data[0] = 0x00;
-    data[1] = 0x00;
-    data[2] = 0x00;
-    data[3] = 0x00;
-    data[4] = 0x00;
-    data[5] = 0x00;
-    data[6] = 0x00;
-    data[7] = 0x00;
+    uint8_t data[8] = {0};
 
-    // Spiegelanklappen
+    // Mirror fold
     if (m_mirror_fold_in_requested) {
         tmp_u8 = 1;
         data[5] = (((uint8_t)tmp_u8) << 7) & 0x80;
@@ -801,7 +919,7 @@ void OvmsVehicleVWeGolf::SendOcuHeartbeat() {
         ESP_LOGI(TAG, "Mirror fold in");
     }
 
-    // Hupen
+    // Horn
     if (m_horn_requested) {
         tmp_u8 = 1;
         data[6] = (((uint8_t)tmp_u8) >> 0) & 0x1;
@@ -827,7 +945,7 @@ void OvmsVehicleVWeGolf::SendOcuHeartbeat() {
         ESP_LOGI(TAG, "DoorUnlock");
     }
 
-    // Warnblinken
+    // Hazard lights
     if (m_indicators_requested) {
         tmp_u8 = 1;
         data[6] = (((uint8_t)tmp_u8) << 3) & 0x8;
@@ -835,17 +953,49 @@ void OvmsVehicleVWeGolf::SendOcuHeartbeat() {
         ESP_LOGI(TAG, "Hazard lights");
     }
 
-    // Panicalarm
-    if (m_panic_mode_requested) {
+    // Panic alarm
+    if (m_panic_requested) {
         tmp_u8 = 1;
         data[6] = (((uint8_t)tmp_u8) << 4) & 0x10;
-        m_panic_mode_requested = false;
+        m_panic_requested = false;
         ESP_LOGI(TAG, "PanicAlarm!");
     }
 
-    comfBus->WriteStandard(0x5A7, length, data);
-    vTaskDelay(pdMS_TO_TICKS(50));
-    ESP_LOGV(TAG, "Heartbeat send ID: data 0->7");
-    ESP_LOGI(TAG, "FHeartbeat send ID:0x5A7 data %02x %02x %02x %02x %02x %02x %02x %02x", data[0],
-             data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
+    m_can3->WriteStandard(0x5A7, 8, data);
+    ESP_LOGV(TAG, "Heartbeat 0x5A7: %02x %02x %02x %02x %02x %02x %02x %02x", data[0], data[1],
+             data[2], data[3], data[4], data[5], data[6], data[7]);
+}
+
+void OvmsVehicleVWeGolf::SendNmAlive() {
+    // Ring drops silent nodes after a few cadences; a one-shot alive on wake survives
+    // long enough for warm-bus commands. The OEM 0x67 cadence is ~1.3 s (observed on-car),
+    // which Ticker1's 1 Hz tick matches.
+    uint8_t data[8] = {0x67, 0x10, 0x41, 0x84, 0x14, 0x00, 0x00, 0x00};
+    m_can3->WriteExtended(0x1B000067, 8, data);
+}
+
+OvmsVehicle::vehicle_command_t OvmsVehicleVWeGolf::CommandClimateControl(bool enable) {
+    // Delegated to the self-contained BatteryControl controller (vehicle_vwegolf_bat_ctrl.cpp):
+    // spare-node NM wake + BAP command over KCAN, independent of the OCU 0x5A7 heartbeat.
+    return m_batctrl.Climate(enable) ? Success : Fail;
+}
+
+OvmsVehicle::vehicle_command_t OvmsVehicleVWeGolf::CommandSetChargeCurrent(uint16_t limit) {
+    // Persistent charge-current-limit edit: RMW profile 0's maxCurrent (snapped to an allowed BCU
+    // step). This is a settings change the car honors on its next charge — it does NOT start a
+    // charge. Shares the BatteryControl command path with climate (one command in flight at a time).
+    return m_batctrl.SetChargeCurrent(limit) ? Success : Fail;
+}
+
+OvmsVehicle::vehicle_command_t OvmsVehicleVWeGolf::CommandStartCharge() {
+    // Arm profile 0 for charge + immediate OperationMode trigger. Validated on-car (2020 e-Golf).
+    // The immediate charge trigger has no factory reference — the factory MIB only edits departure
+    // timers — so this drives Function 0x18 directly.
+    return m_batctrl.Charge(true) ? Success : Fail;
+}
+
+OvmsVehicle::vehicle_command_t OvmsVehicleVWeGolf::CommandStopCharge() {
+    // Op-specific stop (see VWeGolfBatteryControl::Charge): OFF arms the pure-charge op first, so it
+    // is refused while climate is on (that arm would kill climate — stop climate first).
+    return m_batctrl.Charge(false) ? Success : Fail;
 }

@@ -1,5 +1,6 @@
 CXX      := g++
 CXXFLAGS := -std=c++17 -Wall -Wextra -g \
+            -DVWEGOLF_NATIVE_TEST \
             -Imock \
             -I. \
             -I../src \
@@ -7,8 +8,12 @@ CXXFLAGS := -std=c++17 -Wall -Wextra -g \
 
 SRC := mock/mock_ovms.cpp \
        ../src/vehicle_vwegolf.cpp \
+       ../src/vehicle_vwegolf_bat_ctrl.cpp \
+       ../src/bap/bap.cpp \
+       ../src/egolf/battery_control.cpp \
        test_can_decode.cpp \
-       test_crtd_replay.cpp
+       test_crtd_replay.cpp \
+       test_bat_ctrl.cpp
 
 all: test
 
