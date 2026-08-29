@@ -165,8 +165,12 @@ static inline uint32_t ESP32CAN_rxframe(esp32can *me, BaseType_t* task_woken)
       // Request next frame:
       MODULE_ESP32CAN->CMR.B.RRB = 1;
 
-      // Send frame to CAN framework:
-      xQueueSendFromISR(MyCan.m_rxqueue, &msg, task_woken);
+      // Send frame to CAN framework. If the framework queue is full the
+      // frame is lost; count it in rxbuf_overflow so the loss is visible in
+      // `can can1 status` (Rx ovrflw) and in the CST records of a running
+      // CAN log, instead of disappearing silently.
+      if (xQueueSendFromISR(MyCan.m_rxqueue, &msg, task_woken) != pdTRUE)
+        me->m_status.rxbuf_overflow++;
       }
 
     } // while (MODULE_ESP32CAN->SR.B.RBS | MODULE_ESP32CAN->SR.B.DOS)
