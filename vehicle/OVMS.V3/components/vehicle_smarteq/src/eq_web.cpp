@@ -82,15 +82,18 @@ void OvmsVehicleSmartEQ::WebCfgFeatures(PageEntry_t& p, PageContext_t& c)
   auto lock = MyConfig.Lock();
 
   std::string error, full_km, rebootnw, contactor_1h_limit;
-  bool canwrite, canwrite_caron, canwrite_sleep, led, resettrip, resettotal, bcvalue;
+  float ref12V, alert12V;
+  std::string charge12v_threshold;
+  bool canwrite, canwrite_caron, canwrite_caroff, disable_canwrite, led, resettrip, resettotal, bcvalue;
   bool charge12v, extstats, unlocked, tripnotify, opendoors;
   bool obdii79b, obdii79b_cell, obdii743, obdii745, obdii745_tpms, obdii7e4, obdii7e4_dcdc;
 
   if (c.method == "POST") {
     // process form submission:
-    canwrite    = (c.getvar("canwrite") == "yes");
-    canwrite_caron = (c.getvar("canwrite_caron") == "yes");
-    canwrite_sleep = (c.getvar("canwrite_sleep") == "yes");
+    canwrite    = (c.getvar("canwrite_mode") == "ON");
+    canwrite_caron = (c.getvar("canwrite_mode") == "CARON");
+    canwrite_caroff = (c.getvar("canwrite_mode") == "CAROFF");
+    disable_canwrite = (c.getvar("disable_canwrite") == "yes");
     led         = (c.getvar("led") == "yes");
     rebootnw    = (c.getvar("rebootnw"));
     resettrip   = (c.getvar("resettrip") == "yes");
@@ -98,6 +101,7 @@ void OvmsVehicleSmartEQ::WebCfgFeatures(PageEntry_t& p, PageContext_t& c)
     bcvalue     = (c.getvar("bcvalue") == "yes");
     full_km  =  (c.getvar("full_km"));
     charge12v = (c.getvar("charge12v") == "yes");
+    charge12v_threshold = c.getvar("charge12v_threshold");
     unlocked = (c.getvar("unlocked") == "yes");
     extstats = (c.getvar("extstats") == "yes");
     tripnotify = (c.getvar("resetnotify") == "yes");
@@ -110,6 +114,7 @@ void OvmsVehicleSmartEQ::WebCfgFeatures(PageEntry_t& p, PageContext_t& c)
     obdii7e4 = (c.getvar("obdii7e4") == "yes");
     obdii7e4_dcdc = (c.getvar("obdii7e4_dcdc") == "yes");
     contactor_1h_limit = c.getvar("contactor_1h_limit");
+    ref12V = sq->m_ref12V;
 
     // Basic numeric validation:
     auto validFloat = [&](const std::string& s, double minv, double maxv, const char* fname)->bool {
@@ -124,6 +129,7 @@ void OvmsVehicleSmartEQ::WebCfgFeatures(PageEntry_t& p, PageContext_t& c)
     };
     if(!validFloat(full_km, 50, 300, "WLTP km")) full_km = "126.0";
     if(!validFloat(rebootnw, 0, 1440, "Restart Network Time")) rebootnw = "0";
+    if(!validFloat(charge12v_threshold, 11.50, 12.00, "12V trickle charge threshold")) charge12v_threshold = "11.75";
     if(!validFloat(contactor_1h_limit, 1, 100, "Contactor 1h limit")) contactor_1h_limit = "8";
 
     if (error.empty()) {
@@ -139,7 +145,8 @@ void OvmsVehicleSmartEQ::WebCfgFeatures(PageEntry_t& p, PageContext_t& c)
          }
       map.SetValueBool("canwrite", canwrite);
       map.SetValueBool("canwrite.caron", canwrite_caron);
-      map.SetValueBool("canwrite.sleep", canwrite_sleep);
+      map.SetValueBool("canwrite.caroff", canwrite_caroff);
+      map.SetValueBool("canwrite.sleep", disable_canwrite);
       map.SetValueBool("led", led);
       map["rebootnw"] = rebootnw;
       map.SetValueBool("resettrip", resettrip);
@@ -162,6 +169,7 @@ void OvmsVehicleSmartEQ::WebCfgFeatures(PageEntry_t& p, PageContext_t& c)
 
       // Write all changes in one operation
       MyConfig.SetParamMap("xsq", map);
+      MyConfig.SetParamValueFloat("vehicle", "12v.alert", (ref12V - atof(charge12v_threshold.c_str())));
 
       c.head(200);
       c.alert("success", "<p class=\"lead\">Success!</p>");
@@ -177,7 +185,8 @@ void OvmsVehicleSmartEQ::WebCfgFeatures(PageEntry_t& p, PageContext_t& c)
   } else {
     canwrite       = sq->m_enable_write;
     canwrite_caron = sq->m_enable_write_caron;
-    canwrite_sleep = sq->m_enable_write_sleep;
+    canwrite_caroff = sq->m_enable_write_caroff;
+    disable_canwrite = sq->m_disable_write_sleep;
     led            = sq->m_enable_LED_state;
     resettrip      = sq->m_resettrip;
     resettotal     = sq->m_resettotal;
@@ -194,11 +203,15 @@ void OvmsVehicleSmartEQ::WebCfgFeatures(PageEntry_t& p, PageContext_t& c)
     obdii745_tpms  = sq->m_obdii_745_tpms;
     obdii7e4       = sq->m_obdii_7e4;
     obdii7e4_dcdc  = sq->m_obdii_7e4_dcdc;
+    ref12V         = sq->m_ref12V;
+    alert12V       = sq->m_alert12V;
     char def[16];
     snprintf(def, sizeof(def), "%d", sq->m_reboot_time);
     rebootnw       = def;
     snprintf(def, sizeof(def), "%d", sq->m_full_km);
     full_km        = def;
+    snprintf(def, sizeof(def), "%.2f", (ref12V - alert12V));
+    charge12v_threshold = def;
     snprintf(def, sizeof(def), "%d", sq->m_contactor_1h_limit);
     contactor_1h_limit = def;
     c.head(200);
@@ -209,17 +222,30 @@ void OvmsVehicleSmartEQ::WebCfgFeatures(PageEntry_t& p, PageContext_t& c)
   c.form_start(p.uri);
   
   c.fieldset_start("Remote Control");
-  c.input_checkbox("Enable CAN write access #1", "canwrite", canwrite,
-    "<p>CAN write access all time! (OBDII polling, start Preconditioning etc.)</p>");
-  c.input_checkbox("Enable CAN write access #2", "canwrite_caron", canwrite_caron,
-    "<p>CAN write access all time!</p>"
-    "<p>Clears polling list when vehicle is in awake/sleep mode</p>"
-    "<p>This will stop CAN polling when the vehicle is in awake/sleep mode</p>"
-    "<p>Alternative to CAN write access #1; select one or neither!</p>");
-  c.input_checkbox("Disable CAN polling during sleep", "canwrite_sleep", canwrite_sleep,
+
+  std::string canwrite_mode = "OFF";
+  if( canwrite ) canwrite_mode = "ON";
+  else if ( canwrite_caron ) canwrite_mode = "CARON";
+  else if ( canwrite_caroff ) canwrite_mode = "CAROFF";
+  c.input_radiobtn_start("CAN Bus Write Access", "canwrite_mode");
+    c.input_radiobtn_option("canwrite_mode", "Off", "OFF", canwrite_mode == "OFF");
+    c.input_radiobtn_option("canwrite_mode", "On", "ON", canwrite_mode == "ON");
+    c.input_radiobtn_option("canwrite_mode", "Car Off", "CAROFF", canwrite_mode == "CAROFF");
+    c.input_radiobtn_option("canwrite_mode", "Car On", "CARON", canwrite_mode == "CARON");
+  c.input_radiobtn_end(
+    "<dl>"
+    "<dt>Off</dt><dd><p>CAN write is never allowed. The module is only listening to the meesages on the CAN bus</p></dd>"
+    "<dt>On</dt><dd><p>CAN write is allowed at all times (OBDII polling, start Preconditioning etc.)</p></dd>"
+    "<dt>Car Off</dt><dd><p>CAN write access only when car is <strong>OFF</strong>. Clears polling list when vehicle is switched on."
+    " This will stop CAN polling when the vehicle is on and moving</p></dd>"
+    "<dt>Car On</dt><dd><p>CAN write access only, when the car is <strong>ON</strong>."
+    " Polling is disabled, when the vehicle is in awake/sleep mode</p></dd>"
+    "</dl>");
+
+    c.input_checkbox("Disable CAN polling during sleep", "disable_canwrite", disable_canwrite,
     "<p>Clears polling list when vehicle is in sleep mode</p>");
   c.fieldset_end();
-  
+
   // trip reset or OBD activation
   c.fieldset_start("Trip calculated or OBD kWh/100km");
   c.input_checkbox("Reset Trip when Charging", "resettrip", resettrip,
@@ -237,15 +263,22 @@ void OvmsVehicleSmartEQ::WebCfgFeatures(PageEntry_t& p, PageContext_t& c)
   c.fieldset_start("Diff Settings");
   c.input_checkbox("Online state LED", "led", led,
     "<p>RED=no inet, BLUE=inet, GREEN=v2 connected. EGPIO 7,8,9</p>");
-  c.input_checkbox("Enable trickle 12V charging", "charge12v", charge12v,
-    "<p>Charge 12V battery on low-voltage alert</p>"
-    "<p>Trickle charging for the 12V battery is performed via pre-conditioning.</p>"); 
   c.input_checkbox("Door unlocked warning", "unlocked", unlocked,
     "<p>Warn if parked &gt;10min and unlocked</p>");
   c.input_checkbox("Door open warning", "opendoors", opendoors,
     "<p>Warn if parked &gt;10min and doors open</p>");
   c.input_checkbox("Extended statistics", "extstats", extstats,
-      "<p>Maintenance + trip data. Not recommended for iOS app!</p>");  
+      "<p>Maintenance + trip data. Not recommended for iOS app!</p>");
+  c.input_checkbox("Enable trickle 12V charging", "charge12v", charge12v,
+    "<p>Charge 12V battery on low-voltage alert</p>"
+    "<p>Trickle charging for the 12V battery is performed via pre-conditioning.</p>");
+  c.input_slider("Start 12V trickle charge at", "charge12v_threshold", 3, "V",-1, atof(charge12v_threshold.c_str()), 11.75, 11.25, 12.25,0.05,
+      "<p>At this voltage, preconditioning is activated for 15 minutes and the 12V battery is charged.</p>"
+      "<p>Default: 11.75V</p>"
+      "<p>This threshold is calculated as the <b>12V reference voltage</b> minus the <b>12V alert threshold</b>.</p>"
+      "<p>Example: 12V reference voltage = 12.5V, 12V alert threshold = 0.75V, then the trickle charge threshold = 12.5V - 0.75V = 11.75V</p>"
+      "<p>Note: The <b>12V reference voltage</b> and the <b>12V alert threshold</b> can be configured in the <a href=\"/#/cfg/vehicle\">vehicle configuration - 12V Monitor</a>.</p>"
+      "<p>This threshold sets the <b>12V alert threshold</b>.</p>");
   c.input_slider("Restart Network Time", "rebootnw", 3, "min",-1, atof(rebootnw.c_str()), 15, 0, 60, 1,
     "<p>0=off. Auto-restart network on v2 disconnect</p>");
   c.input_slider("Contactor 1h limit", "contactor_1h_limit", 3, "/h",-1, atof(contactor_1h_limit.c_str()), 8, 1, 100, 1,
@@ -383,6 +416,13 @@ void OvmsVehicleSmartEQ::WebCfgTPMS(PageEntry_t& p, PageContext_t& c) {
         c.input_select_option(opt_labels[i], opt_vals[i], *tpms_vals[s] == opt_vals[i]);
       c.input_select_end();
     }
+  c.print("<p><strong>Note:</strong></p>"
+    "<p>Smart TPMS sensors do not always stay in one fixed wheel position.</p>"
+    "<p>They may be front/rear, left/right, or diagonally swapped depending on the vehicle and sensor ID.</p>"
+    "<p>Please check the assignment and correct it if needed.</p>"
+    "<p>After changing the TPMS sensor positions, please drive the vehicle for a few minutes to allow the system to update and reflect the new configuration.</p>"
+    "<p>Ensure that the sensors are correctly assigned to their respective wheel positions to avoid any confusion or incorrect readings.</p>"
+    "<p>Remember to check the tire pressures regularly and maintain them within the recommended range for optimal performance and safety.</p>");
   }
   c.fieldset_end();
 
