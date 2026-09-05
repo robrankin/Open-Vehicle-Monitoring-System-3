@@ -160,13 +160,12 @@ void OvmsVehicleMaxt90::IncomingFrameCan1(CAN_frame_t* p_frame)
       break;
     }
 
-    case 0x748: // The car's own telematics polling the BMS
+    case 0x748: // Another node polling the BMS
     {
-      // The car polls its BMS a few times a second while driving and every
-      // few seconds while charging (either kind), but not when it merely
-      // wakes because a door was opened. The 30 second timeout rides out
-      // the gaps in the charging cadence.
-      m_carpoll_seen_secs = 30;
+      // These requests were once a charge gate ("the car polls its own BMS
+      // while charging"). They stopped when an aftermarket tracker was
+      // removed from the OBD port on 2026-08-29, so they were never the
+      // car's. Kept only as a wake source for the parked backoff.
       ArmFromDormant();
       break;
     }
@@ -220,6 +219,10 @@ void OvmsVehicleMaxt90::IncomingFrameCan1(CAN_frame_t* p_frame)
 void OvmsVehicleMaxt90::IncomingPollReply(const OvmsPoller::poll_job_t& job,
                                           uint8_t* data, uint8_t length)
 {
+  // Any reply from the VCU shows it is awake, one of the charge gates:
+  if (job.moduleid_rec == 0x7eb)
+    m_vcu_seen_secs = kVcuAwakeSecs;
+
   // A reply can arrive split over several frames (VIN, the cell voltage
   // array). Collect the pieces and decode once the last frame is in.
   if (job.mlframe == 0) {
@@ -501,7 +504,7 @@ void OvmsVehicleMaxt90::HandleCharger795(const uint8_t* d, uint8_t length)
 // Charge detection settled (see Ticker1 for the conditions):
 void OvmsVehicleMaxt90::SetChargeStarted()
 {
-  ESP_LOGI(TAG, "Charge started (HV live, car off, plug in, car polling)");
+  ESP_LOGI(TAG, "Charge started (HV live, car off, plug in, VCU awake)");
 
   m_charge_secs = 0;
   StdMetrics.ms_v_charge_inprogress->SetValue(true);
@@ -606,9 +609,9 @@ void OvmsVehicleMaxt90::PollerStateTicker(canbus* bus)
 // ─────────────────────────────────────────────
 void OvmsVehicleMaxt90::Ticker1(uint32_t ticker)
 {
-  if (m_hv_seen_secs > 0)      m_hv_seen_secs--;
-  if (m_on_seen_secs > 0)      m_on_seen_secs--;
-  if (m_carpoll_seen_secs > 0) m_carpoll_seen_secs--;
+  if (m_hv_seen_secs > 0)  m_hv_seen_secs--;
+  if (m_on_seen_secs > 0)  m_on_seen_secs--;
+  if (m_vcu_seen_secs > 0) m_vcu_seen_secs--;
 
   bool hv_live = (m_hv_seen_secs > 0);
   bool on      = (m_on_seen_secs > 0);
@@ -642,14 +645,13 @@ void OvmsVehicleMaxt90::Ticker1(uint32_t ticker)
   }
   else {
     // Charging looks like: HV system live, car not switched on, cable in,
-    // and the car's telematics polling its own ECUs. Each condition rules
-    // out a false positive seen in real captures. Driving is ruled out by
-    // the on check. After switching off, the HV system and the polling run
-    // on for half a minute, but the cable is out. Opening a door with the
-    // cable in wakes the HV system, but the car doesn't poll.
+    // and the VCU answering our polls. Driving is ruled out by the on
+    // check. After switching off, the HV system runs on for 30 s with the
+    // VCU still answering, which is why the conditions have to hold for
+    // kChargeConfirmSecs before the charge is declared.
     if (hv_live && !on &&
-        StdMetrics.ms_v_charge_pilot->AsBool() && m_carpoll_seen_secs > 0) {
-      if (++m_charge_pending_secs >= 10)
+        StdMetrics.ms_v_charge_pilot->AsBool() && m_vcu_seen_secs > 0) {
+      if (++m_charge_pending_secs >= kChargeConfirmSecs)
         SetChargeStarted();
     } else {
       m_charge_pending_secs = 0;

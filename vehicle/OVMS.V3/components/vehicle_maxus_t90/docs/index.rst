@@ -171,15 +171,16 @@ Implementation Notes
   is some other value and is no longer used for this.) The poll state is
   worked out once a second in ``PollerStateTicker()``: charging → 2,
   on → 1, otherwise → 0.
-* Charge detection combines four signals, each of which rules out a false
-  positive seen in real captures. Charging means all of: the ``0x795``
-  broadcast reports the HV system live (it sends the same payload when
-  driving and during both charge types, so it can't be used alone), the
-  car is not switched on (no ``0x266``), the cable is in (``0xE009``),
-  and the car's own telematics is polling the BMS (``0x748`` requests
-  seen on the bus, which don't happen when the car just wakes because a
-  door was opened). Countdown timers in ``Ticker1`` clear each condition
-  when its frames stop.
+* Charge detection combines four signals. Charging means all of: the
+  ``0x795`` broadcast reports the HV system live (it sends the same payload
+  when driving and during both charge types, so it can't be used alone),
+  the car is not switched on (no ``0x266``), the cable is in (``0xE009``),
+  and the VCU is answering our polls (it sleeps while the car is parked).
+  The conditions have to hold for 60 seconds, because the HV system stays
+  live for 30 seconds after a drive ends. Countdown timers in ``Ticker1``
+  clear each condition when its frames stop. (An earlier version used
+  ``0x748`` BMS requests as the fourth signal; those turned out to come
+  from an aftermarket tracker on the OBD port, not the car.)
 * The charge type is settled a few seconds into the charge: ``type2``
   once the on-board charger reports AC current, ``ccs`` if it stays at
   zero.

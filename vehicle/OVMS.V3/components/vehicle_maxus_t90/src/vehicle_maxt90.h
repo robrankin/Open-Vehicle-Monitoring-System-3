@@ -56,23 +56,29 @@ private:
   int m_bms_cells = 110;
 
   // On / charging detection state. The three countdown timers are refreshed
-  // by traffic seen in IncomingFrameCan1 and counted down once a second by
-  // Ticker1, so each condition clears itself when its frames stop:
-  //  - m_hv_seen_secs:      0x795 with a non-zero payload. The HV system is
-  //                         live, which happens when driving and during both
-  //                         AC and DC charging.
-  //  - m_on_seen_secs:      0x266 powertrain broadcast, only sent while the
-  //                         car is switched on. Drives ms_v_env_on.
-  //  - m_carpoll_seen_secs: the car's own telematics polling the BMS (0x748).
-  //                         Seen while driving or charging, but not when the
-  //                         car merely wakes because a door was opened.
-  int m_hv_seen_secs      = 0;
-  int m_on_seen_secs      = 0;
-  int m_carpoll_seen_secs = 0;
+  // by traffic seen on the bus and counted down once a second by Ticker1,
+  // so each condition clears itself when its frames stop:
+  //  - m_hv_seen_secs:  0x795 with a non-zero payload. The HV system is
+  //                     live, which happens when driving and during both
+  //                     AC and DC charging.
+  //  - m_on_seen_secs:  0x266 powertrain broadcast, only sent while the
+  //                     car is switched on. Drives ms_v_env_on.
+  //  - m_vcu_seen_secs: the VCU (0x7e3) answered one of our polls. It is
+  //                     awake while driving and during both charge types,
+  //                     and asleep while the car is parked.
+  int m_hv_seen_secs  = 0;
+  int m_on_seen_secs  = 0;
+  int m_vcu_seen_secs = 0;
+  static const int kVcuAwakeSecs = 30;   // the plug detect is polled every 5 s
 
   // Seconds the charge conditions have held (HV live, car off, plug in,
-  // car polling). The charge is declared once this reaches 10:
+  // VCU awake). The charge is declared once this reaches kChargeConfirmSecs.
+  // That has to outlast the HV run-on after a drive: the HV system stays
+  // live for 30 s after the last 0x266 (29.9 s on each of five drives), and
+  // the on flag clears 5 s after it, so the conditions look like a charge
+  // for about 25 s after every drive.
   int m_charge_pending_secs = 0;
+  static const int kChargeConfirmSecs = 60;
 
   // Seconds since the charge started. Used to settle on "ccs" as the charge
   // type when the on-board charger never reports any AC current:
