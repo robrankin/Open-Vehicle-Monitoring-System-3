@@ -85,7 +85,7 @@ void OvmsVehicleSmartEQ::WebCfgFeatures(PageEntry_t& p, PageContext_t& c)
   float ref12V, alert12V;
   std::string charge12v_threshold;
   bool canwrite, canwrite_caron, canwrite_caroff, disable_canwrite, led, resettrip, resettotal, bcvalue;
-  bool charge12v, extstats, unlocked, tripnotify, opendoors;
+  bool charge12v, extstats, unlocked, tripnotify, opendoors, gpslog;
   bool obdii79b, obdii79b_cell, obdii743, obdii745, obdii745_tpms, obdii7e4, obdii7e4_dcdc;
 
   if (c.method == "POST") {
@@ -106,6 +106,7 @@ void OvmsVehicleSmartEQ::WebCfgFeatures(PageEntry_t& p, PageContext_t& c)
     extstats = (c.getvar("extstats") == "yes");
     tripnotify = (c.getvar("resetnotify") == "yes");
     opendoors = (c.getvar("opendoors") == "yes");
+    gpslog = (c.getvar("gpslog") == "yes");
     obdii79b = (c.getvar("obdii79b") == "yes");
     obdii79b_cell = (c.getvar("obdii79b.cell") == "yes");
     obdii743 = (c.getvar("obdii743") == "yes");
@@ -158,6 +159,7 @@ void OvmsVehicleSmartEQ::WebCfgFeatures(PageEntry_t& p, PageContext_t& c)
       map.SetValueBool("extended.stats", extstats);
       map.SetValueBool("reset.notify", tripnotify);
       map.SetValueBool("door.warning", opendoors);
+      map.SetValueBool("gps.log", gpslog);
       map.SetValueBool("obdii.79b", obdii79b);
       map.SetValueBool("obdii.79b.cell", obdii79b_cell);
       map.SetValueBool("obdii.743", obdii743);
@@ -196,6 +198,7 @@ void OvmsVehicleSmartEQ::WebCfgFeatures(PageEntry_t& p, PageContext_t& c)
     extstats       = sq->m_extendedStats;
     tripnotify     = sq->m_tripnotify;
     opendoors      = sq->m_enable_door_state;
+    gpslog         = sq->m_gps_log_enable;
     obdii79b       = sq->m_obdii_79b;
     obdii79b_cell  = sq->m_obdii_79b_cell;
     obdii743       = sq->m_obdii_743;
@@ -248,6 +251,9 @@ void OvmsVehicleSmartEQ::WebCfgFeatures(PageEntry_t& p, PageContext_t& c)
 
   // trip reset or OBD activation
   c.fieldset_start("Trip calculated or OBD kWh/100km");
+  c.input_checkbox("Enable GPS history log", "gpslog", gpslog,
+    "<p>Opt in to send a GPS history record while driving. This contains position and vehicle data and is disabled by default.</p>"
+    "<p>Note: For OVMS Connect App, this option improves tracking and fills in the waypoints if the connection to the PyOVMS V3 server has been interrupted.</p>");
   c.input_checkbox("Reset Trip when Charging", "resettrip", resettrip,
     "<p>On=reset on charge, Off=reset on drive</p>");
   c.input_checkbox("Reset kWh/100km on car on", "resettotal", resettotal,
@@ -279,7 +285,7 @@ void OvmsVehicleSmartEQ::WebCfgFeatures(PageEntry_t& p, PageContext_t& c)
       "<p>Example: 12V reference voltage = 12.5V, 12V alert threshold = 0.75V, then the trickle charge threshold = 12.5V - 0.75V = 11.75V</p>"
       "<p>Note: The <b>12V reference voltage</b> and the <b>12V alert threshold</b> can be configured in the <a href=\"/#/cfg/vehicle\">vehicle configuration - 12V Monitor</a>.</p>"
       "<p>This threshold sets the <b>12V alert threshold</b>.</p>");
-  c.input_slider("Restart Network Time", "rebootnw", 3, "min",-1, atof(rebootnw.c_str()), 15, 0, 60, 1,
+  c.input_slider("Restart Network Time", "rebootnw", 3, "min",-1, atof(rebootnw.c_str()), 30, 0, 60, 1,
     "<p>0=off. Auto-restart network on v2 disconnect</p>");
   c.input_slider("Contactor 1h limit", "contactor_1h_limit", 3, "/h",-1, atof(contactor_1h_limit.c_str()), 8, 1, 100, 1,
     "<p>Max contactor cycles per hour before alert (default: 8)</p>");

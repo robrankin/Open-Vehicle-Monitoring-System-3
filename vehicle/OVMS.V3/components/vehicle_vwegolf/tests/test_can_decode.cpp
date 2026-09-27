@@ -1,7 +1,7 @@
 // test_can_decode.cpp — Native laptop tests for vehicle_vwegolf CAN frame decoding.
 //
 // Each test builds a CAN_frame_t with real byte values (taken from car captures
-// or the decode comments in vehicle_vwegolf.cpp), calls IncomingFrameCan2/3,
+// or the decode comments in vehicle_vwegolf.cpp), calls IncomingFrameCan3,
 // then checks that the expected metric was set to the expected value.
 //
 // Run:  make test   (from the tests/ directory)
@@ -84,17 +84,17 @@ void test_gear_0x187_park() {
 
     // Gear nibble is byte2 & 0x0F. 2 = Park
     auto f = make_frame(0x187, {0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00});
-    v->IncomingFrameCan2(&f);
+    v->IncomingFrameCan3(&f);
     CHECK(StandardMetrics.ms_v_env_gear->AsValue() == 0, "Park → gear 0");
 
     // 3 = Reverse
     f = make_frame(0x187, {0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00});
-    v->IncomingFrameCan2(&f);
+    v->IncomingFrameCan3(&f);
     CHECK(StandardMetrics.ms_v_env_gear->AsValue() == -1, "Reverse → gear -1");
 
     // 5 = Drive
     f = make_frame(0x187, {0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00});
-    v->IncomingFrameCan2(&f);
+    v->IncomingFrameCan3(&f);
     CHECK(StandardMetrics.ms_v_env_gear->AsValue() == 1, "Drive → gear 1");
 
     delete v;
@@ -107,15 +107,15 @@ void test_vin_0x6B4() {
     // VIN is split across 3 frames identified by byte0 (0, 1, 2).
     // Frame 0: bytes 5-7 = chars 0-2
     auto f0 = make_frame(0x6B4, {0x00, 0x00, 0x00, 0x00, 0x00, 'W', 'V', 'W'});
-    v->IncomingFrameCan2(&f0);
+    v->IncomingFrameCan3(&f0);
 
     // Frame 1: bytes 1-7 = chars 3-9
     auto f1 = make_frame(0x6B4, {0x01, 'Z', 'Z', 'Z', '1', '2', '3', '4'});
-    v->IncomingFrameCan2(&f1);
+    v->IncomingFrameCan3(&f1);
 
     // Frame 2: bytes 1-7 = chars 10-16
     auto f2 = make_frame(0x6B4, {0x02, '5', '6', '7', '8', '9', 'A', 'B'});
-    v->IncomingFrameCan2(&f2);
+    v->IncomingFrameCan3(&f2);
 
     CHECK(StandardMetrics.ms_v_vin->AsValue() == "WVWZZZ123456789AB",
           "VIN assembled from 3 frames");
@@ -260,6 +260,91 @@ void test_sentinel_filters() {
 }
 
 // ---------------------------------------------------------------------------
+// Charge current / power mirroring (0x191 while charging, gated by 0x594)
+// ---------------------------------------------------------------------------
+void test_charge_current_0x191() {
+    printf("\ntest_charge_current_0x191\n");
+
+    // Real on-car capture bytes (mid-charge): 0x191 d1=0x30 d2=0x81 d3=0x00 d4=0x05
+    // decode -> I = 2047 - ((0x30&0xf0)>>4 | (0x81<<4)) = 2047 - 2067 = -20 A (charge),
+    //           V = (0x00 | (0x05&0xf)<<8) * 0.25 = 1280 * 0.25 = 320.0 V,
+    //           P = 320 * -20 / 1000 = -6.4 kW. Charge side flips the sign: +20 A / +6.4 kW.
+    auto charge_frame = make_frame(0x191, {0x00, 0x30, 0x81, 0x00, 0x05, 0x00, 0x00, 0x00});
+
+    // Not charging yet: 0x191 must NOT touch the charge metrics.
+    {
+        auto* v = make_vehicle();
+        v->IncomingFrameCan3(&charge_frame);
+        CHECK(near(StandardMetrics.ms_v_bat_current->AsFloat(), -20.0f), "0x191 bat_current -20 A");
+        CHECK(near(StandardMetrics.ms_v_charge_current->AsFloat(), 0.0f),
+              "charge_current stays 0 A when not charging");
+        CHECK(near(StandardMetrics.ms_v_charge_power->AsFloat(), 0.0f),
+              "charge_power stays 0 kW when not charging");
+        delete v;
+    }
+
+    // Charging (0x594 d[3] bit5 set) then 0x191: charge current/power mirror the pack, sign flipped.
+    {
+        auto* v = make_vehicle();
+        // Real steady-charge 0x594 capture: d[3]=0xA3, bit5 set = charging.
+        auto on = make_frame(0x594, {0x00, 0xF0, 0x21, 0xA3, 0x06, 0x34, 0x30, 0x0D});
+        v->IncomingFrameCan3(&on);
+        CHECK(StandardMetrics.ms_v_charge_inprogress->AsBool(), "0x594 sets charge in progress");
+        v->IncomingFrameCan3(&charge_frame);
+        CHECK(near(StandardMetrics.ms_v_charge_current->AsFloat(), 20.0f),
+              "charge_current +20 A while charging");
+        CHECK(near(StandardMetrics.ms_v_charge_power->AsFloat(), 6.4f),
+              "charge_power +6.4 kW while charging");
+
+        // Charge ends: 0x594 with bit5 clear (d[3]=0x03) zeroes the charge metrics.
+        auto off = make_frame(0x594, {0x00, 0x00, 0x20, 0x03, 0x00, 0x00, 0x10, 0x0D});
+        v->IncomingFrameCan3(&off);
+        CHECK(!StandardMetrics.ms_v_charge_inprogress->AsBool(), "0x594 clears charge in progress");
+        CHECK(near(StandardMetrics.ms_v_charge_current->AsFloat(), 0.0f),
+              "charge_current zeroed on charge stop");
+        CHECK(near(StandardMetrics.ms_v_charge_power->AsFloat(), 0.0f),
+              "charge_power zeroed on charge stop");
+        delete v;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Spurious "Not charging" alert on power-off (charge_state must not flip ""->"stopped")
+// ---------------------------------------------------------------------------
+void test_charge_state_no_spurious_stop() {
+    printf("\ntest_charge_state_no_spurious_stop\n");
+
+    // Fresh boot: charge_state is "" and charging was never in progress. An idle 0x594
+    // (not charging, d[3]=0x03) must NOT write charge_state -> "stopped": that ""->"stopped"
+    // change makes the vehicle framework fire a spurious "Not charging" alert every power cycle.
+    {
+        auto* v = make_vehicle();
+        auto idle = make_frame(0x594, {0x00, 0x00, 0x20, 0x03, 0x00, 0x00, 0x10, 0x0D});
+        v->IncomingFrameCan3(&idle);
+        CHECK(!StandardMetrics.ms_v_charge_inprogress->AsBool(), "idle 0x594 -> not charging");
+        CHECK(StandardMetrics.ms_v_charge_state->AsString().empty(),
+              "charge_state stays empty when never charging (no spurious 'stopped')");
+        CHECK(g_metrics.writes["ms_v_charge_state"] == 0,
+              "charge_state not written on an idle-from-boot frame");
+        delete v;
+    }
+
+    // A real charge session still transitions charge_state charging -> stopped.
+    {
+        auto* v = make_vehicle();
+        auto on = make_frame(0x594, {0x00, 0xF0, 0x21, 0xA3, 0x06, 0x34, 0x30, 0x0D});
+        v->IncomingFrameCan3(&on);
+        CHECK(StandardMetrics.ms_v_charge_state->AsString() == "charging",
+              "charging -> charge_state 'charging'");
+        auto off = make_frame(0x594, {0x00, 0x00, 0x20, 0x03, 0x00, 0x00, 0x10, 0x0D});
+        v->IncomingFrameCan3(&off);
+        CHECK(StandardMetrics.ms_v_charge_state->AsString() == "stopped",
+              "charging->stop -> charge_state 'stopped' (genuine transition)");
+        delete v;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -275,6 +360,8 @@ int main() {
     test_vin_0x6B4();
     test_gps_0x486();
     test_sentinel_filters();
+    test_charge_current_0x191();
+    test_charge_state_no_spurious_stop();
     test_crtd_replay();
     test_bat_ctrl_all();
 

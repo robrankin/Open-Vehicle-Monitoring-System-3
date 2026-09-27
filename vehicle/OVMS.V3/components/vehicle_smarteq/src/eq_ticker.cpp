@@ -137,13 +137,13 @@ void OvmsVehicleSmartEQ::Ticker10(uint32_t ticker)
   if(m_enable_LED_state) 
     OnlineState();
   
-  if(!m_can_active && canCANbusActive())
+  if(canCANbusActive() && (!m_can_active || !m_can_last_acc_state))
     {
     // start polling when conditions are met and the car is not already in polling mode
     smartCoolDownPolling();
     smartOBDpolling();
     }
-  else if((m_can_active || m_can_last_acc_state) && !canCANbusActive()) 
+  else if(!canCANbusActive() && (m_can_active || m_can_last_acc_state)) 
     {    
     // stop polling when conditions are not met and the car is in polling mode
     smartCoolDownPolling();
@@ -164,6 +164,8 @@ void OvmsVehicleSmartEQ::Ticker10(uint32_t ticker)
     {
     smartChargeStart();
     }
+  if (m_gps_log_enable && IsOnEQ() && !StdMetrics.ms_v_pos_latitude->IsStale() && StdMetrics.ms_v_pos_gpslock->AsBool(false))
+    SendGPSLog();
   } // Ticker 10
 
 void OvmsVehicleSmartEQ::Ticker60(uint32_t ticker) 
@@ -180,8 +182,8 @@ void OvmsVehicleSmartEQ::Ticker60(uint32_t ticker)
     StdMetrics.ms_v_charge_12v_voltage->SetValue(0.0f); // reset 12V voltage when not charging to prevent desync
 
   #if defined(CONFIG_OVMS_COMP_WIFI) || defined(CONFIG_OVMS_COMP_CELLULAR)
-    if(m_reboot_time > 0) 
-      Handlev2Server();
+    if((MyOvmsServerV2 || MyOvmsServerV3) && m_reboot_time > 0)
+      HandleServerCon();
   #endif
 
   // DDT4ALL session timeout on 5 minutes

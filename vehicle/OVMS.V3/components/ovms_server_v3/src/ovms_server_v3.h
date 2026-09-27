@@ -64,6 +64,7 @@ class OvmsServerV3 : public OvmsServer, MongooseClient
     void NetmanStop(std::string event, void* data);
     void Ticker1(std::string event, void* data);
     void Ticker60(std::string event, void* data);
+    void LivenessCheck();
     void RequestUpdate(const char* requested);
     void ProcessClientMetricRequest(const std::string& clientid, const std::string& payload);
     void ProcessClientConfigRequest(const std::string& clientid, const std::string& payload);
@@ -110,12 +111,17 @@ class OvmsServerV3 : public OvmsServer, MongooseClient
     int m_updatetime_charging;
     int m_updatetime_sendall;
     int m_updatetime_keepalive;
+    int m_updatetime_probe;
+    int64_t m_last_rx;
+    int64_t m_connected_since;
+    bool m_probe_sent;
     int m_max_per_call_sendall;
     int m_max_per_call_modified;
     bool m_updatetime_priority;
     bool m_legacy_event_topic;
     bool m_retain_depth_limit;
     bool m_updatetime_immediately;
+    bool m_liveness_enabled;
     std::atomic<bool> m_have_immediately;
     bool m_connection_available;
     bool m_notify_info_pending;
@@ -177,5 +183,6 @@ class OvmsServerV3Init
   };
 
 extern OvmsServerV3Init MyOvmsServerV3Init;
+extern OvmsServerV3 *MyOvmsServerV3;
 
 #endif //#ifndef __OVMS_SERVER_V3_H__

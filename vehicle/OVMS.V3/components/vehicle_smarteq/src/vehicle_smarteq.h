@@ -59,6 +59,8 @@
 #include "can.h"
 #include "vehicle.h"
 #include "metrics_standard.h"
+#include "ovms_server_v2.h"
+#include "ovms_server_v3.h"
 
 #include "ovms_config.h"
 #include "ovms_metrics.h"
@@ -115,7 +117,7 @@ class OvmsVehicleSmartEQ : public OvmsVehicle
     void HandleCharging();
     void HandleEnergy();
     void HandleTripcounter();
-    void Handlev2Server();
+    void HandleServerCon();
     void UpdateChargeMetrics();
     int  calcMinutesRemaining(float target, float charge_voltage, float charge_current);
     void HandlePollState();
@@ -138,6 +140,7 @@ class OvmsVehicleSmartEQ : public OvmsVehicle
     void Notify12Vcharge();
     void NotifySOClimit();
     void NotifyHVCycles(bool alert = false);
+    void SendGPSLog();
 
     // --- Door / Lock state ---
     bool DoorOpen();
@@ -454,9 +457,10 @@ class OvmsVehicleSmartEQ : public OvmsVehicle
     bool m_12v_charge_state = false;        // 12V charge state
     bool m_extendedStats = false;           // extended stats for trip and maintenance data
     bool m_enable_calcADCfactor = false;    // enable calculation of ADC factor
+    bool m_gps_log_enable = false;          // enable GPS history log (V2 L message), opt-in only
     bool m_cmd_wakeup = false;              // wakeup command issued
     int m_reboot_ticker = 0;                // ticker for network restart
-    int m_reboot_time = 30;                 // Restart Network time
+    int m_reboot_time = 30;                 // Restart Network time (minutes), when Server connection is lost
     int m_TPMS_FL = 0;                      // TPMS Sensor Front Left
     int m_TPMS_FR = 0;                      // TPMS Sensor Front Right
     int m_TPMS_RL = 0;                      // TPMS Sensor Rear Left
@@ -514,6 +518,7 @@ class OvmsVehicleSmartEQ : public OvmsVehicle
   // private
   // =========================================================================
   private:
+    static size_t m_modifier;
     static OvmsVehicleSmartEQ* GetInstance(OvmsWriter* writer=NULL);
     // ADC factor calculation is needed based on 12V reading, only check when car is on or charging to avoid false recalculations based on 12V drop when car is off
     // activated only after reboot
