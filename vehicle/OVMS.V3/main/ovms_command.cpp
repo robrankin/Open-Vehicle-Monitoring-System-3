@@ -1010,6 +1010,8 @@ OvmsCommandApp::OvmsCommandApp()
   m_logtask = NULL;
   m_logtask_queue = NULL;
   m_logtask_dropcnt = 0;
+  m_logtask_errcnt = 0;
+  m_logtask_lasterr = 0;
   m_logfile_cyclecnt = 0;
   m_expiretask = 0;
 
@@ -1313,12 +1315,83 @@ void OvmsCommandApp::LogTask()
   int syncperiod = m_logfile_syncperiod;
   TickType_t timeout = (syncperiod<=0) ? portMAX_DELAY : pdMS_TO_TICKS(syncperiod*500);
 
+  // Write error recovery: a failed write or sync closes the file, and the task
+  // then retries opening it with an increasing delay (1…60 seconds) instead of
+  // terminating. A single failed write (e.g. a FATFS lock timeout while another
+  // task keeps the SD card busy) would otherwise stop file logging until reboot.
+  // While the file is closed, log messages are dropped (and counted).
+  int retry_delay = 0;                // seconds until the next open attempt
+  uint32_t dropcnt_error = 0;         // m_logtask_dropcnt at the write error
+  time_t time_error = 0;
+
+  auto file_error = [&](const char* op)
+    {
+    m_logtask_lasterr = errno;
+    m_logtask_errcnt++;
+    ESP_LOGE(TAG, "LogTask: %s '%s' failed: %s; closing file, will retry",
+      op, m_logfile_path.c_str(), strerror(m_logtask_lasterr));
+    if (m_logfile)
+      {
+      fclose(m_logfile);
+      m_logfile = NULL;
+      }
+    retry_delay = 1;
+    dropcnt_error = m_logtask_dropcnt;
+    time_error = time(NULL);
+    };
+
+  auto file_reopen = [&]() -> bool
+    {
+    // Don't block on the mutex: StopLogTask() holds it while waiting for this task
+    // to exit, and the exit command will be received with the next queue read.
+    OvmsMutexLock lock(&m_logtask_mutex, 0);
+    if (!lock)
+      return false;
+    if (m_logfile)
+      return true;                    // reopened by "log open" meanwhile
+    if (m_logfile_path.empty())
+      return false;
+#ifdef CONFIG_OVMS_COMP_SDCARD
+    if (startsWith(m_logfile_path, "/sd") &&
+        (!MyPeripherals || !MyPeripherals->m_sdcard || !MyPeripherals->m_sdcard->isavailable()))
+      return false;
+#endif // #ifdef CONFIG_OVMS_COMP_SDCARD
+    struct stat st;
+    m_logfile_size = (stat(m_logfile_path.c_str(), &st) == 0) ? st.st_size : 0;
+    m_logfile = fopen(m_logfile_path.c_str(), "a+");
+    return (m_logfile != NULL);
+    };
+
+  auto file_resumed = [&]()
+    {
+    char ts[32];
+    struct tm tmu;
+    localtime_r(&time_error, &tmu);
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S %Z", &tmu);
+    ESP_LOGW(TAG, "LogTask: file logging resumed after write error at %s (%s), "
+      "%" PRIu32 " messages dropped, unsynced lines before the error may be lost",
+      ts, strerror(m_logtask_lasterr), m_logtask_dropcnt - dropcnt_error);
+    retry_delay = 0;
+    linecnt_synced = m_logtask_linecnt;
+    };
+
   for (;;)
     {
-    if (xQueueReceive(m_logtask_queue, (void*)&cmd, timeout) == pdTRUE)
+    // file reopened by "log open" while waiting for a retry?
+    if (retry_delay && m_logfile)
+      file_resumed();
+
+    TickType_t wait = m_logfile ? timeout : pdMS_TO_TICKS(retry_delay*1000);
+    if (xQueueReceive(m_logtask_queue, (void*)&cmd, wait) == pdTRUE)
       {
       // cmd received:
-      if (cmd.type == LogTaskCmd::LTC_Log)
+      if (cmd.type == LogTaskCmd::LTC_Log && !m_logfile)
+        {
+        // file closed after a write error, waiting for the next open attempt:
+        cmd.data.logbuffers->release();
+        m_logtask_dropcnt++;
+        }
+      else if (cmd.type == LogTaskCmd::LTC_Log)
         {
         // write logbuffers messages:
         for (auto it = cmd.data.logbuffers->begin(); it != cmd.data.logbuffers->end(); it++)
@@ -1361,32 +1434,41 @@ void OvmsCommandApp::LogTask()
           }
         cmd.data.logbuffers->release();
 
+        // check file status:
+        if (ferror(m_logfile))
+          {
+          file_error("writing to");
+          continue;
+          }
+
         // check file size:
         if (m_logfile_maxsize && m_logfile_size > (m_logfile_maxsize*1024))
           {
-          if (!CycleLogfile())
-            break;
+          if (!CycleLogfile() || !m_logfile)
+            file_error("cycling");
           }
         else if (syncperiod < 0 && m_logtask_linecnt >= linecnt_synced - syncperiod)
           {
           linecnt_synced = m_logtask_linecnt;
           uint32_t t0 = esp_timer_get_time();
-          fflush(m_logfile);
-          fsync(fileno(m_logfile));
+          bool synced = (fflush(m_logfile) == 0 && fsync(fileno(m_logfile)) == 0);
           m_logtask_fsynctime += esp_timer_get_time() - t0;
-          }
-
-        // check file status:
-        if (ferror(m_logfile))
-          {
-          ESP_LOGE(TAG, "LogTask: writing to file failed, terminating");
-          break;
+          if (!synced)
+            file_error("syncing");
           }
         }
       else if (cmd.type == LogTaskCmd::LTC_Exit)
         {
         break;
         }
+      }
+    else if (!m_logfile)
+      {
+      // retry timeout: try to reopen the file
+      if (file_reopen())
+        file_resumed();
+      else
+        retry_delay = std::min(retry_delay*2, 60);
       }
     else
       {
@@ -1395,9 +1477,10 @@ void OvmsCommandApp::LogTask()
         {
         linecnt_synced = m_logtask_linecnt;
         uint32_t t0 = esp_timer_get_time();
-        fflush(m_logfile);
-        fsync(fileno(m_logfile));
+        bool synced = (fflush(m_logfile) == 0 && fsync(fileno(m_logfile)) == 0);
         m_logtask_fsynctime += esp_timer_get_time() - t0;
+        if (!synced)
+          file_error("syncing");
         }
       }
     }
@@ -1432,6 +1515,12 @@ void OvmsCommandApp::LogTask()
 bool OvmsCommandApp::StartLogTask(FILE* file)
   {
   OvmsMutexLock lock(&m_logtask_mutex);
+  if (m_logtask && m_logfile)
+    {
+    // the task reopened the file concurrently (write error recovery):
+    fclose(file);
+    return true;
+    }
   m_logfile = file;
   if (m_logtask)
     return true;
@@ -1484,7 +1573,8 @@ bool OvmsCommandApp::StopLogTask()
 
 bool OvmsCommandApp::CloseLogfile()
   {
-  if (!m_logfile)
+  // Note: the task may be running without a file, waiting to reopen it after a write error
+  if (!m_logfile && !m_logtask)
     return true;
   if (!StopLogTask())
     return false;
@@ -1537,7 +1627,7 @@ bool OvmsCommandApp::SetLogfile(std::string path)
   if (path.empty())
     {
     // close:
-    if (m_logfile && !CloseLogfile())
+    if ((m_logfile || m_logtask) && !CloseLogfile())
       {
       ESP_LOGE(TAG, "SetLogfile: error closing '%s'", m_logfile_path.c_str());
       return false;
@@ -1730,15 +1820,20 @@ void OvmsCommandApp::ShowLogStatus(int verbosity, OvmsWriter* writer)
     "  Cycle size       : %u kB\n"
     "  Cycle count      : %" PRIu32 "\n"
     "  Dropped messages : %" PRIu32 "\n"
+    "  Write errors     : %" PRIu32 "%s%s%s\n"
     "  Messages logged  : %" PRIu32 "\n"
     "  Total fsync time : %.1f s\n"
     , m_consoles.size()
-    , m_logfile ? "active" : "inactive"
+    , m_logfile ? "active" : (m_logtask ? "write error, retrying" : "inactive")
     , m_logfile_path.empty() ? "-" : m_logfile_path.c_str()
     , (float) m_logfile_size / 1024.0f
     , m_logfile_maxsize
     , m_logfile_cyclecnt
     , m_logtask_dropcnt
+    , m_logtask_errcnt
+    , m_logtask_errcnt ? " (last: " : ""
+    , m_logtask_errcnt ? strerror(m_logtask_lasterr) : ""
+    , m_logtask_errcnt ? ")" : ""
     , m_logtask_linecnt
     , m_logtask_fsynctime / 1e6);
   }

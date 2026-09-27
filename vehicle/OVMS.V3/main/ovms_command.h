@@ -434,6 +434,8 @@ class OvmsCommandApp : public OvmsWriter
     OvmsMutex m_logtask_mutex;
     QueueHandle_t m_logtask_queue;
     uint32_t m_logtask_dropcnt;
+    uint32_t m_logtask_errcnt;
+    int m_logtask_lasterr;
     uint32_t m_logfile_cyclecnt;
     uint32_t m_logtask_linecnt;
     uint32_t m_logtask_fsynctime;
