@@ -77,6 +77,10 @@ Feature Coverage
    * - 12V DC-DC output voltage
      - Yes
      - Custom metric ``xmt.v.dcdc.voltage`` (BMS ``0xB136``)
+   * - 12V charging
+     - Yes
+     - ``ms_v_env_charging12v`` follows the HV-live frame ``0x795`` (the
+       DC-DC runs while driving and charging)
    * - Odometer
      - Yes
      - From CAN ID ``0x540`` → ``ms_v_pos_odometer`` (0.1 km resolution)

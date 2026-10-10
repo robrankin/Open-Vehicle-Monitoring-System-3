@@ -623,6 +623,13 @@ void OvmsVehicleMaxt90::Ticker1(uint32_t ticker)
     StdMetrics.ms_v_env_on->SetValue(on);
   }
 
+  // The DC-DC converter charges the 12V battery whenever the HV system is
+  // live (driving and both charge types). Power management needs this to
+  // tell parked from running: without it the modem is powered off
+  // modemoff_delay hours after boot, even while driving.
+  if (StdMetrics.ms_v_env_charging12v->AsBool() != hv_live)
+    StdMetrics.ms_v_env_charging12v->SetValue(hv_live);
+
   if (StdMetrics.ms_v_charge_inprogress->AsBool()) {
     m_charge_pending_secs = 0;
     m_charge_secs++;
