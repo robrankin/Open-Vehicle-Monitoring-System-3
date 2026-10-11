@@ -95,6 +95,9 @@ void powermgmt::Ticker1(std::string event, void* data)
       {
       ESP_LOGI(TAG,"Charging 12V battery..");
       m_charging=true;
+      // Restart the not-charging period, or the power off checks below would
+      // still see the old one and turn the WiFi and modem straight back off:
+      m_notcharging_timer=0;
       // Turn on WiFi and modem if they were previously turned off by us
 #ifdef CONFIG_OVMS_COMP_WIFI
       if (m_wifi_off)
