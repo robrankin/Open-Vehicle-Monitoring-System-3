@@ -3,6 +3,7 @@ static const char *TAG = "v-maxt90";
 
 #include <stdio.h>
 #include <string>
+#include "esp_timer.h"
 #include "vehicle_maxt90.h"
 #include "vehicle_obdii.h"
 #include "metrics_standard.h"
@@ -24,8 +25,6 @@ OvmsVehicleMaxt90::OvmsVehicleMaxt90()
     MyMetrics.InitFloat("xmt.b.capacity", 0, 88.5f, kWh, true);
   m_dcdc_voltage =
     MyMetrics.InitFloat("xmt.v.dcdc.voltage", 120, 0.0f, Volts, false);
-  m_batt_voltage_limit =
-    MyMetrics.InitFloat("xmt.b.voltage.limit", 120, 0.0f, Volts, false);
 
   // BMS cell monitor. The BMS reports 110 cell voltages (LFP, ~3.31 V each)
   // and 3 temperature sensors; the arrangement follows what 0xB142 returns.
@@ -86,7 +85,7 @@ OvmsVehicleMaxt90::OvmsVehicleMaxt90()
 
     // BMS (0x748/0x7c8) battery data. The BMS uses a 0xB1xx DID map,
     // not the 0xE0xx map the eDeliver3 uses.
-    // Pack voltage
+    // Pack current
     { 0x748, 0x7c8, VEHICLE_POLL_TYPE_OBDIIEXTENDED, 0xB105,
       { 0, 10, 10 }, 0, ISOTP_STD },
     // Cell voltage max / min / average
@@ -387,22 +386,28 @@ void OvmsVehicleMaxt90::IncomingPollReply(const OvmsPoller::poll_job_t& job,
       break;
     }
 
-    case 0xB105: { // BMS computed voltage limit (u16, 0.01 V units)
-      // This was first taken for the pack voltage, but it reads BELOW the
-      // resting voltage while a DC rapid charge pushes 150 A in, which a
-      // terminal measurement can't do. It behaves like a computed lower
-      // voltage limit (it rises as the pack warms during a rapid charge and
-      // sits ~40 V under the cell sum at rest), so it is kept as a custom
-      // metric until its meaning is settled. The real pack voltage comes
-      // from the cell data (0xB114 / 0xB142). 0x8000 is the BMS marker for
-      // "no value yet", seen while the pack electronics start up.
-      if (job.moduleid_rec == 0x7c8 && len >= 2 && m_batt_voltage_limit) {
+    case 0xB105: { // Pack current (u16, 0.1 A units, offset 32768)
+      // Negative while charging, positive while driving. Checked against
+      // the logged AC charge current: 7, 12 and 28 A at the plug read -4.2,
+      // -7.1 and -17.6 A here, which is the plug power over the pack
+      // voltage. A DC rapid charge reads about -135 A, and driving ranges
+      // from -180 A (regen) to +445 A. 0x8000 is a real 0 A, not a missing
+      // value. (This was first taken for the pack voltage, then for a
+      // voltage limit, because 0.01 V units happen to give a plausible
+      // ~327 V.)
+      if (job.moduleid_rec == 0x7c8 && len >= 2) {
         uint16_t raw = u16be(d);
-        if (raw == 0x8000)
+        if (raw == 0xFFFF)
           break;
-        float volts = raw / 100.0f;
-        if (volts > 100 && volts < 500)
-          m_batt_voltage_limit->SetValue(volts);
+        float amps = ((int)raw - 32768) / 10.0f;
+        StdMetrics.ms_v_bat_current->SetValue(amps);
+
+        float volts = StdMetrics.ms_v_bat_voltage->AsFloat();
+        if (volts > 0) {
+          float kw = amps * volts / 1000.0f;
+          StdMetrics.ms_v_bat_power->SetValue(kw);
+          AddChargeEnergy(kw);
+        }
       }
       break;
     }
@@ -507,6 +512,8 @@ void OvmsVehicleMaxt90::SetChargeStarted()
   ESP_LOGI(TAG, "Charge started (HV live, car off, plug in, VCU awake)");
 
   m_charge_secs = 0;
+  m_energy_time_us = 0;
+  StdMetrics.ms_v_charge_kwh->SetValue(0);
   StdMetrics.ms_v_charge_inprogress->SetValue(true);
   StdMetrics.ms_v_charge_mode->SetValue("standard");
   StdMetrics.ms_v_charge_state->SetValue("charging");
@@ -528,6 +535,22 @@ void OvmsVehicleMaxt90::SetChargeStopped()
   StdMetrics.ms_v_charge_state->SetValue(
     (StdMetrics.ms_v_bat_soc->AsFloat() >= 99) ? "done" : "stopped");
   StdMetrics.ms_v_charge_substate->SetValue("");
+}
+
+// Adds the energy that went into the pack since the last pack power sample
+// to the charge session total. Called with each pack power reading
+// (negative while charging). A gap of more than a minute between samples
+// is skipped rather than guessed at.
+void OvmsVehicleMaxt90::AddChargeEnergy(float kw)
+{
+  int64_t now = esp_timer_get_time();
+  if (StdMetrics.ms_v_charge_inprogress->AsBool() && kw < 0 &&
+      m_energy_time_us > 0 && now - m_energy_time_us <= 60000000LL) {
+    float hours = (now - m_energy_time_us) / 3600e6f;
+    StdMetrics.ms_v_charge_kwh->SetValue(
+      StdMetrics.ms_v_charge_kwh->AsFloat() - kw * hours);
+  }
+  m_energy_time_us = now;
 }
 
 // Poll transmit result. success == false means the frame went unacknowledged

@@ -41,11 +41,9 @@ private:
   //  - xmt.v.hvac.temp     : HVAC / coolant temperature (°C)
   //  - xmt.b.capacity      : Nominal pack capacity (kWh)
   //  - xmt.v.dcdc.voltage  : 12V DC-DC output voltage (V)
-  //  - xmt.b.voltage.limit : BMS computed voltage limit (V), see 0xB105
   OvmsMetricFloat* m_hvac_temp_c        = nullptr; // xmt.v.hvac.temp
   OvmsMetricFloat* m_pack_capacity_kwh  = nullptr; // xmt.b.capacity
   OvmsMetricFloat* m_dcdc_voltage       = nullptr; // xmt.v.dcdc.voltage
-  OvmsMetricFloat* m_batt_voltage_limit = nullptr; // xmt.b.voltage.limit
 
   // Reassembly buffer for poll replies that span several frames
   // (VIN, BMS cell voltage array):
@@ -83,6 +81,11 @@ private:
   // Seconds since the charge started. Used to settle on "ccs" as the charge
   // type when the on-board charger never reports any AC current:
   int m_charge_secs = 0;
+
+  // Time of the last pack power sample (esp_timer microseconds, 0 = none
+  // yet this charge). The charged energy is added up from these samples:
+  int64_t m_energy_time_us = 0;
+  void AddChargeEnergy(float kw);
 
   // Parked no-poll backoff.
   //
