@@ -149,6 +149,31 @@ TLS client authentication
 The module supports client certificate authentication (mTLS) for brokers that need it.
 Paste the PEM certificate and key into the **Config → Server V3 (MQTT)** web page.
 
+By default the broker certificate is checked against the built-in trusted CAs
+plus any in ``/store/trustedca``. To trust only your own CA, for example a
+private CA for a self-hosted broker, point ``tls.cafile`` at its PEM file. The
+connection then fails if that file is missing, rather than falling back::
+
+  OVMS# config set server.v3 tls.cafile /store/tls/serverv3_ca.crt
+
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Session and reconnect options
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- ``cleansession`` (default: ``no``) — connect with the MQTT clean session
+  flag, so the broker discards the session and any messages queued while the
+  module was offline. Use this if a command queued hours ago should not be
+  run when the module reconnects.
+- ``authfail.retry`` (default: ``0``) — what to do when the broker refuses the
+  connection (bad credentials, client ID or certificate). ``0`` suspends the
+  connection until the configuration changes. A number of seconds keeps
+  retrying, starting at that interval and doubling up to one hour.
+
+Example::
+
+  OVMS# config set server.v3 cleansession yes
+  OVMS# config set server.v3 authfail.retry 300
+
 -------------------------------
 Upgrading from OVMS v1/v2 to v3
 -------------------------------

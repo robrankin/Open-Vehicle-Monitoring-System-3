@@ -92,6 +92,10 @@ class OvmsServerV3 : public OvmsServer, MongooseClient
     std::string m_password;
     std::string m_port;
     bool m_tls;
+    std::string m_tls_cafile;
+    bool m_cleansession;
+    int m_authfail_retry;
+    int m_authfail_wait;
     std::string m_topic_prefix;
     std::string m_will_topic;
     std::string m_conn_topic[MQTT_CONN_NTOPICS];

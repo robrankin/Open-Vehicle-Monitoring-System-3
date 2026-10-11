@@ -108,6 +108,8 @@ static void OvmsServerV3MongooseCallback(struct mg_connection *nc, int ev, void 
           opts.will_topic = MyOvmsServerV3->m_will_topic.c_str();
           opts.will_message = "no";
           opts.flags |= MG_MQTT_WILL_RETAIN;
+          if (MyOvmsServerV3->m_cleansession)
+            opts.flags |= MG_MQTT_CLEAN_SESSION;
           opts.keep_alive = MyOvmsServerV3->m_updatetime_keepalive;
           mg_set_protocol_mqtt(nc);
           mg_send_mqtt_handshake_opt(nc, MyOvmsServerV3->m_clientid.c_str(), opts);
@@ -149,6 +151,22 @@ static void OvmsServerV3MongooseCallback(struct mg_connection *nc, int ev, void 
             MyOvmsServerV3->SetStatus("Server temporarily unavailable", true, OvmsServerV3::WaitReconnect);
             MyOvmsServerV3->m_connretry = 30;
             }
+          else if (MyOvmsServerV3->m_authfail_retry > 0)
+            {
+            // Auth issue, but configured to keep trying. Back off (doubling up
+            // to one hour) so a broker-side mistake doesn't strand the module
+            // and a working config doesn't hammer the server:
+            int wait = MyOvmsServerV3->m_authfail_wait;
+            if (wait < MyOvmsServerV3->m_authfail_retry)
+              wait = MyOvmsServerV3->m_authfail_retry;
+            MyOvmsServerV3->SetStatus("Authentication error (wrong user/password/client ID), will retry", true, OvmsServerV3::WaitReconnect);
+            MyOvmsServerV3->m_connretry = wait;
+            MyOvmsServerV3->m_authfail_wait = (wait >= 1800) ? 3600 : wait * 2;
+            MyNotify.NotifyStringf("alert", "server.v3.auth.failure",
+              "Incorrect server V3 login credentials or client ID (MQTT CONNACK return code 0x%02X)\n"
+              "V3 server connection retry in %d seconds",
+              msg->connack_ret_code, wait);
+            }
           else
             {
             // Auth issue, user needs to fix config, suspend reconnect to avoid IP blocking:
@@ -166,6 +184,7 @@ static void OvmsServerV3MongooseCallback(struct mg_connection *nc, int ev, void 
         if (MyOvmsServerV3)
           {
           const int64_t now = monotonictime;
+          MyOvmsServerV3->m_authfail_wait = 0;
           MyOvmsServerV3->m_last_rx = now;
           MyOvmsServerV3->m_connected_since = now;
           MyOvmsServerV3->m_probe_sent = false;
@@ -259,6 +278,8 @@ OvmsServerV3::OvmsServerV3(const char* name)
   SetStatus("Server has been started", false, WaitNetwork);
   m_connretry = 0;
   m_connection_counter = 0;
+  m_authfail_wait = 0;
+  m_cleansession = false;
   m_mgconn = NULL;
   m_sendall = false;
   m_lasttx = 0;
@@ -997,6 +1018,7 @@ void OvmsServerV3::Connect()
   m_password = MyConfig.GetParamValue("password", "server.v3");
   m_port = MyConfig.GetParamValue("server.v3", "port");
   m_tls = MyConfig.GetParamValueBool("server.v3","tls", false);
+  m_tls_cafile = MyConfig.GetParamValue("server.v3", "tls.cafile");
 
   m_clientid = MyConfig.GetParamValue("server.v3", "clientid");
   if (m_clientid.empty())
@@ -1076,7 +1098,22 @@ void OvmsServerV3::Connect()
   if (m_tls)
     {
 #if CONFIG_MG_ENABLE_SSL
-    opts.ssl_ca_cert = MyOvmsTLS.GetTrustedList();
+    if (!m_tls_cafile.empty())
+      {
+      // Trust only this CA, not the built-in roots. A missing file fails the
+      // connection rather than falling back to the full trusted list:
+      if (!path_exists(m_tls_cafile))
+        {
+        ESP_LOGE(TAG, "TLS CA file %s not found", m_tls_cafile.c_str());
+        SetStatus("Error: TLS CA file not found", true, WaitReconnect);
+        m_connretry = 60;
+        m_connection_counter = 0;
+        return;
+        }
+      opts.ssl_ca_cert = m_tls_cafile.c_str();
+      }
+    else
+      opts.ssl_ca_cert = MyOvmsTLS.GetTrustedList();
     opts.ssl_server_name = m_server.c_str();
     if (path_exists("/store/tls/serverv3_client.crt") && path_exists("/store/tls/serverv3_client.key"))
       {
@@ -1298,6 +1335,13 @@ void OvmsServerV3::ConfigChanged(OvmsConfigParam* param)
     m_updatetime_probe = param->GetValueInt("updatetime.probe", m_updatetime_probe);
     if (m_updatetime_probe < 10) m_updatetime_probe = 10;
     m_liveness_enabled = param->GetValueBool("liveness.enabled", m_liveness_enabled);
+    if (param->GetValueBool("cleansession", false) != m_cleansession)
+      {
+      m_cleansession = !m_cleansession;
+      do_reconnect = true;
+      }
+    m_authfail_retry = param->GetValueInt("authfail.retry", 0);
+    if (m_authfail_retry < 0) m_authfail_retry = 0;
     m_legacy_event_topic = param->GetValueBool("events.legacy_topic", true);
     m_retain_depth_limit = param->GetValueBool("retain.depth.limit", m_retain_depth_limit);
     m_updatetime_priority = param->GetValueBool("updatetime.priority", false);
@@ -1323,6 +1367,7 @@ void OvmsServerV3::ConfigChanged(OvmsConfigParam* param)
     if (param->GetValue("server") != m_server ||
         param->GetValue("port") != m_port ||
         param->GetValueBool("tls") != m_tls ||
+        param->GetValue("tls.cafile") != m_tls_cafile ||
         param->GetValue("user") != m_user ||
         param->GetValue("clientid") != m_clientid ||
         param->GetValue("topic.prefix") != m_topic_prefix)
