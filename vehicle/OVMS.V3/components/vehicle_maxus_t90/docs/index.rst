@@ -42,10 +42,17 @@ Feature Coverage
      - Notes
    * - SOC display
      - Yes
-     - From OBD-II PID ``0xE002`` → ``ms_v_bat_soc``
+     - From BMS DID ``0xD117`` (0.1 %) → ``ms_v_bat_soc``, falling back to
+       the VCU's whole-percent PID ``0xE002`` if the BMS hasn't answered
+       for 3 minutes
+   * - Range estimate
+     - Yes
+     - The car's own estimate from CAN ID ``0x6F0`` (whole km) →
+       ``ms_v_bat_range_est`` and ``ms_v_bat_range_ideal``
    * - SOH display
      - Yes
-     - From OBD-II PID ``0xE003`` → ``ms_v_bat_soh`` (with filtering)
+     - From OBD-II PID ``0xE003`` → ``ms_v_bat_soh`` (with filtering).
+       Also sets ``ms_v_bat_cac`` from the nominal 245.83 Ah
    * - Battery capacity
      - Yes
      - Custom metric ``xmt.b.capacity`` (fixed 88.5 kWh)
@@ -136,9 +143,15 @@ Feature Coverage
    * - TPMS
      - No
      - No TPMS integration yet
-   * - Door/window state
-     - No
-     - Only global lock/unlock is currently decoded
+   * - Door state / headlights
+     - Yes
+     - From CAN ID ``0x375`` → ``ms_v_door_fl/fr/rl/rr`` and
+       ``ms_v_env_headlights``. Decoded on a left-hand-drive car; on a
+       right-hand-drive car the front doors may be swapped (not yet checked)
+   * - HVAC status
+     - Yes
+     - From CAN ID ``0x510`` → ``ms_v_env_cabinfan`` (%),
+       ``ms_v_env_cabinsetpoint`` and ``ms_v_env_hvac``
    * - Remote lock/unlock control
      - No
      - Read-only lock status only
@@ -227,5 +240,5 @@ PIDs and CAN messages have been fully reverse engineered:
 * Speed (not present on the powertrain CAN; the standard OBD speed PID
   answers but always reads zero, so it likely needs the chassis CAN on
   OBD pins 3 and 11).
-* Additional body / door / window state.
+* Window state.
 * Remote climate control and other remote vehicle actions, if feasible.

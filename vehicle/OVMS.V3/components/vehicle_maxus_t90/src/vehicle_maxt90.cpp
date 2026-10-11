@@ -9,6 +9,26 @@ static const char *TAG = "v-maxt90";
 #include "metrics_standard.h"
 #include "ovms_metrics.h"
 
+// Seconds since boot, for the SOC fallback (not affected by GPS clock
+// changes):
+static inline uint32_t now_s()
+{
+  return (uint32_t)(esp_timer_get_time() / 1000000LL);
+}
+
+// The VCU's integer SOC is only used if the BMS hasn't given its 0.1 % SOC
+// for this long:
+static const uint32_t SOC_FALLBACK_S = 180;
+
+// Nominal pack capacity in Ah, for v.b.cac:
+static const float CAC_NOMINAL_AH = 245.83f;
+
+// Cabin fan steps on 0x510:
+static const int HVAC_FAN_STEPS = 9;
+
+// Highest range estimate on 0x6F0 taken as real:
+static const unsigned RANGE_MAX_KM = 600;
+
 OvmsVehicleMaxt90::OvmsVehicleMaxt90()
 {
   ESP_LOGI(TAG, "Initialising Maxus T90 EV vehicle module (derived from OBDII)");
@@ -85,6 +105,9 @@ OvmsVehicleMaxt90::OvmsVehicleMaxt90()
 
     // BMS (0x748/0x7c8) battery data. The BMS uses a 0xB1xx DID map,
     // not the 0xE0xx map the eDeliver3 uses.
+    // SOC in 0.1 %. Takes over from the VCU's integer SOC (0xE002).
+    { 0x748, 0x7c8, VEHICLE_POLL_TYPE_OBDIIEXTENDED, 0xD117,
+      { 0, 30, 15 }, 0, ISOTP_STD },
     // Pack current
     { 0x748, 0x7c8, VEHICLE_POLL_TYPE_OBDIIEXTENDED, 0xB105,
       { 0, 10, 10 }, 0, ISOTP_STD },
@@ -107,6 +130,11 @@ OvmsVehicleMaxt90::OvmsVehicleMaxt90()
   // Attach the poll list to CAN1 & start in "off" state
   PollSetPidList(m_can1, maxt90_polls);
   PollSetState(0);
+
+  // The charge metrics are persistent, so a charge in progress when the
+  // module last stopped would otherwise still be reported. Ticker1 declares
+  // it again if the car really is charging.
+  StdMetrics.ms_v_charge_inprogress->SetValue(false);
 
   ESP_LOGI(TAG, "Maxus T90 EV poller configured on CAN1 @ 500 kbps");
 }
@@ -173,6 +201,73 @@ void OvmsVehicleMaxt90::IncomingFrameCan1(CAN_frame_t* p_frame)
     {
       HandleCharger795(d, p_frame->FIR.B.DLC);
       ArmFromDormant();
+      break;
+    }
+
+    case 0x375: // Doors & headlights
+    {
+      // Broadcast continuously; only act when the bytes we use change.
+      static bool seen = false;
+      static uint8_t last0 = 0, last1 = 0;
+      if (seen && d[0] == last0 && d[1] == last1)
+        break;
+      seen = true; last0 = d[0]; last1 = d[1];
+
+      // Byte 0: 0x20 front left, 0x40 front right, 0x80 rear right.
+      // Byte 1: 0x01 rear left. Decoded on a left-hand-drive car, where
+      // 0x20 is the driver's door. On this right-hand-drive van 0x20 is
+      // also the most-opened door by far, so the bits may follow driver
+      // and passenger rather than left and right (not yet checked).
+      StdMetrics.ms_v_door_fl->SetValue((d[0] & 0x20) != 0);
+      StdMetrics.ms_v_door_fr->SetValue((d[0] & 0x40) != 0);
+      StdMetrics.ms_v_door_rr->SetValue((d[0] & 0x80) != 0);
+      StdMetrics.ms_v_door_rl->SetValue((d[1] & 0x01) != 0);
+
+      // Low nibble of byte 0: 01 park, 03 low beam, 07 high beam, 13 fog+low
+      StdMetrics.ms_v_env_headlights->SetValue((d[0] & 0x0F) >= 0x03);
+      break;
+    }
+
+    case 0x510: // HVAC status
+    {
+      static bool seen = false;
+      static uint8_t last0 = 0, last1 = 0, last5 = 0;
+      if (seen && d[0] == last0 && d[1] == last1 && d[5] == last5)
+        break;
+      seen = true; last0 = d[0]; last1 = d[1]; last5 = d[5];
+
+      // Byte 0 low nibble: fan step 0..9 (the high nibble is the air route)
+      StdMetrics.ms_v_env_cabinfan->SetValue(
+        ((d[0] & 0x0F) * 100) / HVAC_FAN_STEPS);
+
+      // Byte 1: set point + 40, 0x39 = LOW to 0x49 = HIGH. Anything outside
+      // that range is ignored rather than published as -40.
+      if (d[1] >= 0x30 && d[1] <= 0x50)
+        StdMetrics.ms_v_env_cabinsetpoint->SetValue((float)d[1] - 40.0f);
+
+      // Byte 5: 0x20 HVAC on, 0x80 A/C
+      StdMetrics.ms_v_env_hvac->SetValue((d[5] & 0x20) != 0);
+      break;
+    }
+
+    case 0x6F0: // Range estimate
+    {
+      static bool seen = false;
+      static uint8_t last0 = 0, last1 = 0;
+      if (seen && d[0] == last0 && d[1] == last1)
+        break;
+      seen = true; last0 = d[0]; last1 = d[1];
+
+      // Bytes 0-1, little-endian, whole km. Tracks SOC at about 4.2 km per
+      // percent across our captures. Zero means the cluster is asleep, not
+      // that the range is zero, so the last real value is kept.
+      unsigned km = (unsigned)d[0] | ((unsigned)d[1] << 8);
+      if (km > 0 && km <= RANGE_MAX_KM) {
+        StdMetrics.ms_v_bat_range_est->SetValue((float)km);
+        // The car gives one number; the ABRP plugin falls back to the
+        // ideal range, so set both.
+        StdMetrics.ms_v_bat_range_ideal->SetValue((float)km);
+      }
       break;
     }
 
@@ -246,11 +341,13 @@ void OvmsVehicleMaxt90::IncomingPollReply(const OvmsPoller::poll_job_t& job,
       break;
     }
 
-    case 0xE002: { // SOC (%)
+    case 0xE002: { // SOC, integer %. Only used while the BMS SOC is stale.
       if (len >= 1) {
         float soc = d[0];
         if (soc > 0 && soc <= 100) {
-          if (StdMetrics.ms_v_bat_soc->AsFloat() != soc) {
+          bool bms_fresh = m_bms_soc_seen &&
+                           (now_s() - m_bms_soc_time) < SOC_FALLBACK_S;
+          if (!bms_fresh && StdMetrics.ms_v_bat_soc->AsFloat() != soc) {
             StdMetrics.ms_v_bat_soc->SetValue(soc);
             ESP_LOGD(TAG, "SOC: %.0f %%", soc);
           }
@@ -258,6 +355,23 @@ void OvmsVehicleMaxt90::IncomingPollReply(const OvmsPoller::poll_job_t& job,
           ESP_LOGW(TAG,
                    "Invalid SOC %.1f ignored (car likely off or poll timeout)",
                    soc);
+        }
+      }
+      break;
+    }
+
+    case 0xD117: { // BMS SOC (u16, 0.1 % units)
+      if (job.moduleid_rec == 0x7c8 && len >= 2) {
+        float soc = u16be(d) / 10.0f;
+        if (soc > 0 && soc <= 100) {
+          m_bms_soc_time = now_s();
+          m_bms_soc_seen = true;
+          if (StdMetrics.ms_v_bat_soc->AsFloat() != soc) {
+            StdMetrics.ms_v_bat_soc->SetValue(soc);
+            ESP_LOGD(TAG, "SOC (BMS): %.1f %%", soc);
+          }
+        } else {
+          ESP_LOGW(TAG, "Invalid BMS SOC %.1f ignored", soc);
         }
       }
       break;
@@ -276,6 +390,7 @@ void OvmsVehicleMaxt90::IncomingPollReply(const OvmsPoller::poll_job_t& job,
 
         if (StdMetrics.ms_v_bat_soh->AsFloat() != soh) {
           StdMetrics.ms_v_bat_soh->SetValue(soh);
+          StdMetrics.ms_v_bat_cac->SetValue(soh * CAC_NOMINAL_AH / 100.0f);
           ESP_LOGD(TAG, "SOH: %.2f %%", soh);
         }
       }
@@ -623,6 +738,13 @@ void OvmsVehicleMaxt90::PollerStateTicker(canbus* bus)
              charging ? "true" : "false",
              on ? "true" : "false",
              m_dormant ? "true" : "false");
+    if (want == 0 || want == kDormantPollState) {
+      // The contactors are open and B105 is no longer polled, so without
+      // this the last driving or charging current would stay reported
+      // until the next drive:
+      StdMetrics.ms_v_bat_current->SetValue(0);
+      StdMetrics.ms_v_bat_power->SetValue(0);
+    }
     PollSetState(want);
   }
 }

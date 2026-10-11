@@ -49,6 +49,11 @@ private:
   // (VIN, BMS cell voltage array):
   std::string m_rxbuf;
 
+  // BMS SOC (0.1 %, 0xD117) takes precedence over the VCU's integer SOC
+  // (0xE002) while it is fresh:
+  uint32_t m_bms_soc_time = 0;     // seconds since boot of the last reply
+  bool     m_bms_soc_seen = false;
+
   // Cell count last reported by BMS DID 0xB142; sets the BMS monitor
   // arrangement when it changes:
   int m_bms_cells = 110;
