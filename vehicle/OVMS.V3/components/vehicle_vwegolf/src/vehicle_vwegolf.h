@@ -82,6 +82,9 @@ class OvmsVehicleVWeGolf : public OvmsVehicle {
     // (0x391) frames in IncomingFrameCan3.
     bool m_kl15_on = false;
     bool m_drivetrain_ready = false;
+    // HV electrical system active (0x187 d[1] bit 7 = opendbc Motor_EV_01 HV_Bordnetz_aktiv). While the
+    // HV system is up the DC-DC converter supplies the 12V network -> drives v.e.charging12v.
+    bool m_hv_active = false;
 
     // Seconds since the last KCAN (can3) frame arrived. Reset to 0 in IncomingFrameCan3,
     // incremented each second in Ticker1. Bus is alive while < VWEGOLF_BUS_TIMEOUT_SECS.
@@ -134,12 +137,15 @@ class OvmsVehicleVWeGolf : public OvmsVehicle {
     // D1 = 1, D2 = 2, D3 = 3, B = 4. -1 = N/A (not in gear D or B).
     OvmsMetricInt* m_recup_level = nullptr;
 
+    // Heated front windshield
+    OvmsMetricBool* m_env_heated_front_window = nullptr;
+
     // `xvg charge profile list` handler: fetch the car's charge profiles (charge locations) via the
     // BatteryControl controller and print them to the writer. Blocks (bounded) while the BCU is woken
     // and answers. Read-only — it never writes a profile.
     void CommandListProfiles(OvmsWriter* writer);
     // `xvg charge profile set` handler: RMW selected fields of one profile (profile 0 = current/minsoc/
-    // temp; charge locations 1-3 = flags/current/soc). Blocks (bounded) for the controller's result.
+    // temp/frontwindow; charge locations 1-3 = flags/current/soc). Blocks (bounded) for the controller's result.
     void CommandSetProfile(OvmsWriter* writer, int argc, const char* const* argv);
 
     // `xvg charge timer ...` handlers. list = read-only; set/enable/disable/clear write to the car

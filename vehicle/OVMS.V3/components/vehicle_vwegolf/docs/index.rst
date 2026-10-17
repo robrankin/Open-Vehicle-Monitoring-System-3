@@ -78,8 +78,18 @@ Charge Interruption Alerts  No
 Charge Control              Charge-current limit, start/stop (see below)
 Lock/Unlock Vehicle         No
 Valet Mode Control          No
+12V Charging Status         Yes (``v.e.charging12v``, see below)
 Others
 =========================== ==============
+
+-------------------
+12V Charging Status
+-------------------
+
+* ``v.e.charging12v`` is set while the DC-DC converter charges the 12V battery. The e-Golf has no alternator, so
+  this is whenever the HV system is up: the HV-system-active bit of KCAN frame 0x187 (bit 15, ``HV_Bordnetz_aktiv``
+  of ``Motor_EV_01`` in opendbc), HV charging in progress, or remote climate running. It clears when KCAN goes silent
+* OVMS Power Management (``power`` config) relies on this metric to tell whether the 12V battery is being charged
 
 ---------------------
 Cabin Climate Control
@@ -88,6 +98,16 @@ Cabin Climate Control
 * Temperature setpoint is set in the car's infotainment system (e-Manager)
 * Climatise on battery power is force-enabled
 * OVMS may show the car as charging/plugged-in even if it is not charging/plugged-in
+* Front windscreen heating can be included in pre-conditioning with ``xvg charge profile set 0 frontwindow on``
+  (``off`` to disable). The setting is stored in the car and applies to every climate start until it is changed;
+  it can also be changed while climate is running. ``xvg charge profile list`` shows it as ``fw`` on profile 0.
+  The car's infotainment has no equivalent setting
+* The windscreen heating will not turn on unless the outside temperature is below 4 °C, even when the option is
+  enabled. This threshold is set in the HVAC module (08) adaptation
+  "IDE07303-Rem.start funct.:activ.temper. of windshield defrost.heat." (default 4 °C) and cannot be changed by OVMS
+* The metric ``xvg.v.env.heated_front_window`` shows whether windscreen heating is active as part of remote
+  pre-conditioning. It does not reflect the windscreen heater button on the dashboard
+* The windscreen heater uses additional energy, which reduces range when climatising on battery power
 
 --------------
 Charge Control

@@ -1,6 +1,12 @@
 Open Vehicle Monitor System v3 - Change log
 
 ????-??-?? ???  ???????  OTA release
+- smart EQ: Added a trickle charge configuration Website
+  New command:
+    xsq climate <minutes>         -- start pre-conditioning for xx minutes
+    xsq trickle <minutes>         -- start trickle 12V charge for xx minutes
+  New configs:
+  - [xsq] 12v.trickle.time (int, default 10)  -- trickle time in minutes
 - New vehicle: Toyota e-TNGA platform, supporting the Subaru Solterra (SUBSOL) and the
     Toyota bZ4X (TOYBZ4X) via the OBD-II port. The two vehicles are thin wrappers over a shared
     platform module which carries the CAN polling, the charging state machine and the BMS
@@ -56,6 +62,9 @@ Open Vehicle Monitor System v3 - Change log
   New notifications (+ implied events):
     - [alert] server.v2.auth.failure         -- Incorrect server V2 login credentials
     - [alert] server.v3.auth.failure         -- Incorrect server V3 login credentials
+- VW e-Golf: set v.e.charging12v (12V battery charging) while the HV system is active (KCAN
+    0x187 HV_Bordnetz_aktiv), HV charging is in progress or remote climate is running. The DC-DC
+    converter is the only 12V charge source; Power Management relies on this metric.
 - VW e-Golf: set v.e.drivemode from the Charisma / Fahrprofilauswahl active profile
     (KCAN 0x386): Normal/Eco/Eco+ -> 1/2/3 (matching the e-Up module), replacing the
     incorrect B-gear-derived value.
@@ -74,6 +83,17 @@ Open Vehicle Monitor System v3 - Change log
     via a read-modify-write that preserves every other stored field, with maxCurrent hard-capped.
     "xvg charge timer list/set/enable/disable/clear" manage the recurring departure timers, each
     bound to a charge profile. See the built-in command help for the arguments of each.
+- VW e-Golf: front windscreen heating for remote cabin pre-conditioning. "xvg charge profile set 0
+    frontwindow on|off" (alias "fw") sets or clears the front window heater option of the global
+    profile 0 ("Optionen"), which climate control runs; the setting is stored in the car and stays
+    until changed, and can also be changed while climate is running. "xvg charge profile list"
+    shows the option as "fw". The car's infotainment has no equivalent setting. The windscreen is
+    only heated when the outside temperature is below 4 C (HVAC module 08 adaptation "IDE07303-Rem.start
+    funct.:activ.temper. of windshield defrost.heat.", default 4 C).
+  New metric:
+    - xvg.v.env.heated_front_window    -- Front windscreen heating active during remote
+                                          pre-conditioning (bool, KCAN 0x594); does not
+                                          reflect the dashboard heater button
 - vehicle_cadillac_ct5:
     Set the acceptance filter to allow 0x063 (v.on) and 0x5E4 (v.b.soc).
     The high frame rate of this vehicle (> 1600/sec) causes watchdog

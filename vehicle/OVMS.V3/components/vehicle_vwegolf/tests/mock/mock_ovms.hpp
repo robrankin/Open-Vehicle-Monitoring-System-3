@@ -224,6 +224,7 @@ struct StandardMetricsType {
     OvmsMetricBool*   ms_v_env_awake            = new OvmsMetricBool("ms_v_env_awake");
     OvmsMetricBool*   ms_v_env_locked           = new OvmsMetricBool("ms_v_env_locked");
     OvmsMetricBool*   ms_v_env_hvac             = new OvmsMetricBool("ms_v_env_hvac");
+    OvmsMetricBool*   ms_v_env_charging12v      = new OvmsMetricBool("ms_v_env_charging12v");
     OvmsMetricInt*    ms_v_env_parktime         = new OvmsMetricInt("ms_v_env_parktime");
     // Doors
     OvmsMetricBool*   ms_v_door_fl              = new OvmsMetricBool("ms_v_door_fl");
@@ -265,6 +266,14 @@ struct OvmsMetrics {
         static std::map<std::string, std::unique_ptr<OvmsMetricInt>> registry;
         auto& slot = registry[name];
         if (!slot) slot.reset(new OvmsMetricInt(name));
+        slot->SetValue(value);
+        return slot.get();
+    }
+    // InitBool mirrors InitInt for boolean custom metrics (e.g. xvg.v.env.heated_front_window).
+    OvmsMetricBool* InitBool(const char* name, int /*autostale*/ = 0, bool value = false) {
+        static std::map<std::string, std::unique_ptr<OvmsMetricBool>> registry;
+        auto& slot = registry[name];
+        if (!slot) slot.reset(new OvmsMetricBool(name));
         slot->SetValue(value);
         return slot.get();
     }
