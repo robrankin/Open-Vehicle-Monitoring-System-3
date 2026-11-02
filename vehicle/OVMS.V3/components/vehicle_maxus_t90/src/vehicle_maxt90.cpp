@@ -90,7 +90,7 @@ OvmsVehicleMaxt90::OvmsVehicleMaxt90()
     { 0x7e3, 0x7eb, VEHICLE_POLL_TYPE_OBDIIEXTENDED, 0xE010,
       { 0, 30, 30 }, 0, ISOTP_STD },
 
-    // Ambient temp
+    // E025: was taken for ambient temp, is really a load signal (see below)
     { 0x7e3, 0x7eb, VEHICLE_POLL_TYPE_OBDIIEXTENDED, 0xE025,
       { 0, 30, 30 }, 0, ISOTP_STD },
 
@@ -450,31 +450,13 @@ void OvmsVehicleMaxt90::IncomingPollReply(const OvmsPoller::poll_job_t& job,
       break;
     }
 
-    case 0xE025: { // Ambient temperature (°C)
-      if (len >= 2) {
-        uint16_t raw = u16be(d);
-        float ta = raw / 10.0f;
-
-        bool env_on = StdMetrics.ms_v_env_on->AsBool();
-
-        // Ignore the constant bogus 7.5 °C we see when the car is off
-        if (!env_on && raw == 75) {
-          ESP_LOGW(TAG,
-                   "Ambient temp raw=0x%04x (%.1f °C) ignored (car off/default)",
-                   raw, ta);
-          break;
-        }
-
-        // Filter out default/bogus data
-        if (raw == 0x0200 || raw == 0xFFFF || ta < -50 || ta > 80) {
-          ESP_LOGW(TAG, "Invalid ambient temp raw=0x%04x (%.1f °C) ignored",
-                   raw, ta);
-          break;
-        }
-
-        StdMetrics.ms_v_env_temp->SetValue(ta);
-        ESP_LOGD(TAG, "Ambient temp: %.1f °C", ta);
-      }
+    case 0xE025: { // Not ambient temperature: a load signal, meaning unknown
+      // While driving it tracks pack current (r = 0.85) and changes by 10+
+      // units between 30 s polls; it sits at its floor (75) when idle or
+      // regenerating. It is not used for v.e.temp any more. Still polled so
+      // the CAN logs keep it for decoding.
+      if (len >= 2)
+        ESP_LOGD(TAG, "E025 raw=%u", u16be(d));
       break;
     }
 
@@ -543,12 +525,15 @@ void OvmsVehicleMaxt90::IncomingPollReply(const OvmsPoller::poll_job_t& job,
       break;
     }
 
-    case 0xB110: { // Pack temperature sensors (3 x s16, 0.1 °C units)
+    case 0xB110: { // Pack temperature sensors (3 x u16, 0.5 °C units, -50 °C offset)
+      // The high byte of each pair has always read 0x00. Checked against an
+      // outdoor sensor and a 30-minute DC charge (pack 18 -> 29 °C); the old
+      // 0.1 °C reading only moved 2 °C over that charge.
       if (job.moduleid_rec == 0x7c8 && len >= 6) {
         float sum = 0;
         BmsRestartCellTemperatures();
         for (int i = 0; i < 3; i++) {
-          float t = (int16_t)u16be(d + i * 2) / 10.0f;
+          float t = u16be(d + i * 2) * 0.5f - 50.0f;
           BmsSetCellTemperature(i, t);
           sum += t;
         }

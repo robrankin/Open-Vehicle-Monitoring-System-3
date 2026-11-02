@@ -74,8 +74,8 @@ Feature Coverage
        the count is real.
    * - Battery temperatures
      - Yes
-     - From BMS DID ``0xB110`` (3 sensors) → BMS monitor and
-       ``ms_v_bat_temp``
+     - From BMS DID ``0xB110`` (3 sensors, 0.5 °C units, -50 °C offset) →
+       BMS monitor and ``ms_v_bat_temp``
    * - 12V battery current
      - Yes
      - From VCU PID ``0xE022`` → ``ms_v_bat_12v_current`` (0.1 A units,
@@ -104,8 +104,9 @@ Feature Coverage
      - Yes
      - From OBD-II PID ``0xE010`` → custom metric ``xmt.v.hvac.temp``
    * - Ambient temperature
-     - Yes
-     - From OBD-II PID ``0xE025`` → ``ms_v_env_temp``
+     - No
+     - No source found. PID ``0xE025`` was used before, but it follows
+       the drive load, not the outside air
    * - GPS location
      - Yes
      - Provided by the OVMS modem GPS (not vehicle-specific)
