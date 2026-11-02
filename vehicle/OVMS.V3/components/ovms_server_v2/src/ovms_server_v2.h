@@ -149,6 +149,7 @@ class OvmsServerV2 : public OvmsServer, MongooseClient
     int m_streaming;
     int m_updatetime_idle;
     int m_updatetime_connected;
+    bool m_legacy_field_enc;
 
     uint32_t m_lastrx_time = 0;
     int m_ping_ticker = 0;
@@ -162,6 +163,14 @@ class OvmsServerV2 : public OvmsServer, MongooseClient
     bool m_pending_notify_data;
     uint32_t m_pending_notify_data_last;
     int m_pending_notify_data_retransmit;
+    bool m_ota_paused;
+
+#ifdef CONFIG_OVMS_SC_JAVASCRIPT_DUKTAPE
+  public:
+    void CheckDuktapeJobsCompleted();
+  private:
+    std::list<DuktapeEvalJob*> m_duktape_jobs;
+#endif
   };
 
 class OvmsServerV2Init

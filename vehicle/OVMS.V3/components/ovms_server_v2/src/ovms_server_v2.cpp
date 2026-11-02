@@ -181,6 +181,17 @@ static void OvmsServerV2MongooseCallback(struct mg_connection *nc, int ev, void 
   {
   switch (ev)
     {
+#ifdef CONFIG_OVMS_SC_JAVASCRIPT_DUKTAPE
+    case MG_EV_POLL:
+      {
+      if (MyOvmsServerV2)
+        {
+        // Check for completed async Javascript jobs:
+        MyOvmsServerV2->CheckDuktapeJobsCompleted();
+        }
+      }
+      break;
+#endif
     case MG_EV_CONNECT:
       {
       int *success = (int*)p;
@@ -533,7 +544,7 @@ void OvmsServerV2::ProcessCommand(const char* payload)
       MyNotify.NotifyCommand("info","charge.stopped","stat");
       *buffer << "MP-0 c6,0";
       break;
-    case 7: // Execute command
+    case 7: // Execute shell command, parameter <cmd> → sync result <output>
       {
       BufferedShell* bs = new BufferedShell(false, COMMAND_RESULT_NORMAL);
       bs->SetSecure(true); // this is an authorized channel
@@ -542,7 +553,56 @@ void OvmsServerV2::ProcessCommand(const char* payload)
       extram::string val; bs->Dump(val);
       delete bs;
       *buffer << "MP-0 c7,0,";
-      *buffer << mp_encode(val);
+      *buffer << mp_encode(val, m_legacy_field_enc);
+      break;
+      }
+    case 8: // Execute javascript command, parameters <id>,<cmd> → async result <id>,<output>
+      {
+      // Parse & check parameters:
+      char *id0 = sep ? sep+1 : NULL;
+      if (!id0 || !*id0)
+        {
+        *buffer << "MP-0 c8,1," << id0 << ",Missing ID";
+        break;
+        }
+      char *cmd0 = index(id0, ',');
+      if (!cmd0 || !*cmd0)
+        {
+        *buffer << "MP-0 c8,1," << id0 << ",Missing command";
+        break;
+        }
+      std::string id(id0, cmd0-id0);
+      std::string cmd(++cmd0);
+      
+      #ifndef CONFIG_OVMS_SC_JAVASCRIPT_DUKTAPE
+        *buffer << "MP-0 c8,1," << id << ",No JavaScript support in firmware";
+      #else
+        if (!MyDuktape.DukTapeAvailable())
+          {
+          *buffer << "MP-0 c8,1," << id << ",JavaScript engine not started";
+          }
+        else
+          {
+          // Prepare async Javascript execution:
+          auto job = new DuktapeEvalJob(cmd, id);
+          if (!job)
+            {
+            *buffer << "MP-0 c8,1," << id << ",Out of memory";
+            }
+          else if (!job->Dispatch(pdMS_TO_TICKS(50)))
+            {
+            *buffer << "MP-0 c8,1," << id << ",JavaScript queue overflow";
+            delete job;
+            }
+          else
+            {
+            // The command has been queued for execution by the Duktape task,
+            // MG_EV_POLL → CheckDuktapeJobsCompleted() handles sending the result
+            ESP_LOGD(TAG, "DuktapeEvalJob ID '%s' command '%s' queued", id.c_str(), cmd.c_str());
+            m_duktape_jobs.push_back(job);
+            }
+          }
+      #endif
       break;
       }
     case 10: // Set Charge Mode
@@ -760,9 +820,44 @@ void OvmsServerV2::ProcessCommand(const char* payload)
       break;
     }
 
-  Transmit(buffer->str().c_str());
+  if (buffer->tellp() > 0)
+    Transmit(buffer->str().c_str());
   delete buffer;
   }
+
+
+#ifdef CONFIG_OVMS_SC_JAVASCRIPT_DUKTAPE
+
+void OvmsServerV2::CheckDuktapeJobsCompleted()
+  {
+  auto it = m_duktape_jobs.begin();
+  while (it != m_duktape_jobs.end())
+    {
+    DuktapeEvalJob *job = *it;
+    if (job->CheckComplete())
+      {
+      std::string id = job->GetID();
+      ESP_LOGD(TAG, "DuktapeEvalJob ID '%s' complete", id.c_str());
+      // send response:
+      std::string msg = "MP-0 c8,0,";
+      msg += id;
+      msg += ",";
+      msg += mp_encode(job->GetOutput(), m_legacy_field_enc);
+      Transmit(msg);
+      // done:
+      delete job;
+      it = m_duktape_jobs.erase(it);
+      }
+    else
+      {
+      //ESP_LOGV(TAG, "DuktapeEvalJob ID '%s' waiting", job->GetID().c_str());
+      ++it;
+      }
+    }
+  }
+
+#endif // CONFIG_OVMS_SC_JAVASCRIPT_DUKTAPE
+
 
 bool OvmsServerV2::Transmit(const std::string& message, TickType_t timeout /*=portMAX_DELAY*/)
   {
@@ -1760,7 +1855,7 @@ void OvmsServerV2::TransmitNotifyInfo()
     extram::ostringstream buffer;
     buffer
       << "MP-0 PI"
-      << mp_encode(e->GetValue());
+      << mp_encode(e->GetValue(), m_legacy_field_enc);
     if (Transmit(buffer.str().c_str()))
       {
       info->MarkRead(MyOvmsServerV2Reader, e);
@@ -1820,7 +1915,7 @@ void OvmsServerV2::TransmitNotifyAlert()
     extram::ostringstream buffer;
     buffer
       << "MP-0 PA"
-      << mp_encode(e->GetValue());
+      << mp_encode(e->GetValue(), m_legacy_field_enc);
     if (Transmit(buffer.str().c_str()))
       {
       alert->MarkRead(MyOvmsServerV2Reader, e);
@@ -2005,15 +2100,15 @@ bool OvmsServerV2::IncomingNotification(OvmsNotifyType* type, OvmsNotifyEntry* e
   if (strcmp(type->m_name,"info")==0)
     {
     // Info notifications
-    if (!StandardMetrics.ms_s_v2_connected->AsBool())
+    if (!StandardMetrics.ms_s_v2_connected->AsBool() || m_ota_paused)
       {
       m_pending_notify_info = true;
-      return false; // No connection, so leave it queued for when we do
+      return false; // No connection or paused for OTA, so leave it queued
       }
     extram::ostringstream buffer;
     buffer
       << "MP-0 PI"
-      << mp_encode(entry->GetValue());
+      << mp_encode(entry->GetValue(), m_legacy_field_enc);
     bool txok = Transmit(buffer.str().c_str(), 0);
     if (!txok) m_pending_notify_info = true;
     return txok; // Mark it as read if we've managed to send it
@@ -2021,10 +2116,10 @@ bool OvmsServerV2::IncomingNotification(OvmsNotifyType* type, OvmsNotifyEntry* e
   else if (strcmp(type->m_name,"error")==0)
     {
     // Error notification
-    if (!StandardMetrics.ms_s_v2_connected->AsBool())
+    if (!StandardMetrics.ms_s_v2_connected->AsBool() || m_ota_paused)
       {
       m_pending_notify_error = true;
-      return false; // No connection, so leave it queued for when we do
+      return false; // No connection or paused for OTA, so leave it queued
       }
     extram::ostringstream buffer;
     buffer
@@ -2037,15 +2132,15 @@ bool OvmsServerV2::IncomingNotification(OvmsNotifyType* type, OvmsNotifyEntry* e
   else if (strcmp(type->m_name,"alert")==0)
     {
     // Alert notifications
-    if (!StandardMetrics.ms_s_v2_connected->AsBool())
+    if (!StandardMetrics.ms_s_v2_connected->AsBool() || m_ota_paused)
       {
       m_pending_notify_alert = true;
-      return false; // No connection, so leave it queued for when we do
+      return false; // No connection or paused for OTA, so leave it queued
       }
     extram::ostringstream buffer;
     buffer
       << "MP-0 PA"
-      << mp_encode(entry->GetValue());
+      << mp_encode(entry->GetValue(), m_legacy_field_enc);
     bool txok = Transmit(buffer.str().c_str(), 0);
     if (!txok) m_pending_notify_alert = true;
     return txok; // Mark it as read if we've managed to send it
@@ -2065,11 +2160,19 @@ bool OvmsServerV2::IncomingNotification(OvmsNotifyType* type, OvmsNotifyEntry* e
  */
 void OvmsServerV2::EventListener(std::string event, void* data)
   {
-  if (event == "system.modem.received.ussd")
+  if (event == "ota.flash.starting")
+    {
+    m_ota_paused = true;
+    }
+  else if (event == "ota.flash.done" || event == "ota.flash.abort")
+    {
+    m_ota_paused = false;
+    }
+  else if (event == "system.modem.received.ussd")
     {
     // forward USSD response to server:
     std::string buf = "MP-0 c41,0,";
-    buf.append(mp_encode(std::string((char*) data)));
+    buf.append(mp_encode(std::string((char*) data), m_legacy_field_enc));
     Transmit(buf);
     }
   else if (event == "config.changed" || event == "config.mounted")
@@ -2094,6 +2197,7 @@ void OvmsServerV2::ConfigChanged(OvmsConfigParam* param)
   m_streaming = MyConfig.GetParamValueInt("vehicle", "stream", 0);
   m_updatetime_connected = MyConfig.GetParamValueInt("server.v2", "updatetime.connected", 60);
   m_updatetime_idle = MyConfig.GetParamValueInt("server.v2", "updatetime.idle", 600);
+  m_legacy_field_enc = MyConfig.GetParamValueBool("server.v2", "workaround.legacy_field_enc", false);
 
   if (!param) return;
 
@@ -2218,6 +2322,9 @@ void OvmsServerV2::Ticker1(std::string event, void* data)
         }
       }
 
+    if (m_ota_paused)
+      return;
+
     // Periodic transmission of metrics
     bool caron = StandardMetrics.ms_v_env_on->AsBool();
     int next = (m_peers==0) ? m_updatetime_idle : m_updatetime_connected;
@@ -2307,6 +2414,7 @@ OvmsServerV2::OvmsServerV2(const char* name)
   m_streaming = 0;
   m_updatetime_idle = 600;
   m_updatetime_connected = 60;
+  m_legacy_field_enc = false;
   m_lasttx = 0;
   m_lasttx_stream = 0;
   m_peers = 0;
@@ -2319,6 +2427,7 @@ OvmsServerV2::OvmsServerV2(const char* name)
   m_pending_notify_data = false;
   m_pending_notify_data_last = 0;
   m_pending_notify_data_retransmit = 0;
+  m_ota_paused = false;
 
   if (MyConfig.GetParamValue("vehicle", "units.distance").compare("M") == 0)
     m_units_distance = Miles;
@@ -2355,6 +2464,9 @@ OvmsServerV2::OvmsServerV2(const char* name)
   MyEvents.RegisterEvent(TAG,"config.mounted", std::bind(&OvmsServerV2::EventListener, this, _1, _2));
   MyEvents.RegisterEvent(TAG,"location.alert.flatbed.moved", std::bind(&OvmsServerV2::EventListener, this, _1, _2));
   MyEvents.RegisterEvent(TAG,"location.alert.valet.bounds", std::bind(&OvmsServerV2::EventListener, this, _1, _2));
+  MyEvents.RegisterEvent(TAG,"ota.flash.starting", std::bind(&OvmsServerV2::EventListener, this, _1, _2));
+  MyEvents.RegisterEvent(TAG,"ota.flash.done", std::bind(&OvmsServerV2::EventListener, this, _1, _2));
+  MyEvents.RegisterEvent(TAG,"ota.flash.abort", std::bind(&OvmsServerV2::EventListener, this, _1, _2));
 
   // read config:
   ConfigChanged(NULL);
@@ -2377,6 +2489,15 @@ OvmsServerV2::~OvmsServerV2()
     delete m_buffer;
     m_buffer = NULL;
     }
+#ifdef CONFIG_OVMS_SC_JAVASCRIPT_DUKTAPE
+  while (!m_duktape_jobs.empty())
+    {
+    // delete back to front to minimize potential completion waits
+    auto job = m_duktape_jobs.back();
+    m_duktape_jobs.pop_back();
+    delete job;
+    }
+#endif
   MyEvents.SignalEvent("server.v2.stopped", NULL);
   }
 
