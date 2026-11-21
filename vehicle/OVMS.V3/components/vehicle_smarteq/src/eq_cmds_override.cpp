@@ -57,8 +57,10 @@ OvmsVehicle::vehicle_command_t OvmsVehicleSmartEQ::CommandClimateControlEQ(bool 
     m_climate_restart_ticker = 0;
     m_climate_restart = false;
     m_climate_trickle = false;
+    m_trickle_counted = false;
+    m_first_startup = 0;
     return Success;
-    }  
+    }
 
   if (StdMetrics.ms_v_bat_soc->AsInt(can_soc) < 31)
     {    
@@ -69,6 +71,8 @@ OvmsVehicle::vehicle_command_t OvmsVehicleSmartEQ::CommandClimateControlEQ(bool 
     m_climate_restart_ticker = 0;
     m_climate_restart = false;
     m_climate_trickle = false;
+    m_trickle_counted = false;
+    m_first_startup = 0;
     return Fail;
     }
 
@@ -99,25 +103,32 @@ OvmsVehicle::vehicle_command_t OvmsVehicleSmartEQ::CommandClimateControlEQ(bool 
     char msg[100];
     if (IsOnHVACEQ())
       {
+      time_t now = time(NULL);
       m_climate_restart_ticker = minutes;
       // if true, climate will be restarted after 5 minutes by Ticker1, if false, climate will not be restarted after 5 minutes
       m_climate_restart = m_climate_restart_ticker > 6 ? true : false;
       if (trickle) 
         {
+        if (!restart && !m_climate_trickle)
+          {
+          m_trickle_counted = false;
+          m_trickle_voltage = StdMetrics.ms_v_bat_12v_voltage->AsFloat(0.0f);
+          }
         // reset trickle flag if less than 5 minutes;
         m_climate_trickle = m_climate_restart_ticker > 6 ? true : false;
         ESP_LOGI(TAG, "activated 12V trickle charging successfully");
         // Check the 12V ADC factors based on the 12V readings, as long as trickle charging is active.
         m_check12vadc = true;
-        if(m_climate_restart_ticker > m_12v_trickle_time - 2)
+        if (!m_trickle_counted)
           {
-          time_t now = time(NULL);
+          m_trickle_counted = true;
           while (!m_12v_trickle_charge_times.empty() && (now - m_12v_trickle_charge_times.front()) > 24 * 3600)
             m_12v_trickle_charge_times.pop_front();
 
           m_12v_trickle_charge_times.push_back((uint32_t)now);
           mt_12v_trickle_charge_count->SetValue((int)m_12v_trickle_charge_times.size());
           ESP_LOGI(TAG, "12V trickle charging activation count within 24h: %d", mt_12v_trickle_charge_count->AsInt(0));
+          m_first_startup = now + (m_climate_restart_ticker * 60);
           Notify12Vcharge();
           }        
 
@@ -132,10 +143,10 @@ OvmsVehicle::vehicle_command_t OvmsVehicleSmartEQ::CommandClimateControlEQ(bool 
           m_12v_charge = false; // deactivate trickle charging to prevent further stress on the 12V battery
           }
         }
-      else
+      else if (now > m_first_startup)
         {
-        // minutes to display time if restart is true, because climate will be restarted after 5/10/.. minutes
-        int minutes_display = m_climate_restart ? minutes : 5;
+        m_first_startup = now + (m_climate_restart_ticker * 60);
+        int minutes_display = m_climate_restart ? minutes + 2 : 5;
         snprintf(msg, sizeof(msg), "%d minutes Pre-conditioning started, HV SOC is %d%%", minutes_display, StdMetrics.ms_v_bat_soc->AsInt(can_soc));
         ESP_LOGI(TAG, "%s", msg);
         MyNotify.NotifyString("info", "climatecontrol.schedule", msg);
@@ -144,6 +155,11 @@ OvmsVehicle::vehicle_command_t OvmsVehicleSmartEQ::CommandClimateControlEQ(bool 
       }
     else
       {
+      m_climate_restart_ticker = 0;
+      m_climate_restart = false;
+      m_climate_trickle = false;
+      m_trickle_counted = false;
+      m_first_startup = 0;
       if (trickle) 
         {
         snprintf(msg, sizeof(msg), "Failed to activate 12V trickle charging! 12V is %.2f, HV SOC is %d%%", m_trickle_voltage, StdMetrics.ms_v_bat_soc->AsInt(can_soc));
@@ -202,25 +218,22 @@ OvmsVehicle::vehicle_command_t OvmsVehicleSmartEQ::CommandWakeup() {
   if (!m_can_last_acc_state) 
     {
     smartCANbusAccess(true); // enable CAN write access to send wakeup command
+    vTaskDelay(50 / portTICK_PERIOD_MS);
     }  
 
   ESP_LOGI(TAG, "Send Wakeup Command");
-
-  OvmsVehicle::vehicle_command_t res = Fail;
 
   if(!IsAwakeEQ()) 
     {
     uint8_t data[8] = {0xc3, 0x00, 0x00, 0x00, 0x14, 0x70, 0x96, 0x85};
     uint8_t data2[4] = {0x40, 0x00, 0x00, 0x00};
-    canbus *obd;
-    obd = m_can1;
+    canbus *obd = m_can1;
     smartCoolDownPolling(30); // 30 seconds cooldown to allow the vehicle to wake up
 
-    for (int i = 0; i < 7; i++) 
+    for (int i = 0; i < 10; i++) 
       {
       if (IsAwakeEQ()) 
         {
-        res = Success;
         break;
         }      
       obd->WriteStandard(0x350, 8, data);
@@ -228,16 +241,22 @@ OvmsVehicle::vehicle_command_t OvmsVehicleSmartEQ::CommandWakeup() {
       obd->WriteStandard(0x634, 4, data2);
       vTaskDelay(200 / portTICK_PERIOD_MS);
       }
-    res = Success;
-    m_cmd_wakeup = true;
-    ESP_LOGI(TAG, "Vehicle is now awake");
+
+    if (IsAwakeEQ())
+      {
+      m_cmd_wakeup = true;
+      vTaskDelay(500 / portTICK_PERIOD_MS); // allow ECUs to stabilize before diagnostic requests
+      ESP_LOGI(TAG, "Vehicle is now awake");
+      return Success;
+      }
+    ESP_LOGE(TAG, "Vehicle wakeup failed (timeout)");
+    return Fail;
     } 
   else 
     {
-    res = Success;
     ESP_LOGI(TAG, "Vehicle is awake");
+    return Success;
     }
-  return res;
 }
 
 // lock: can can1 tx st 745 04 30 01 00 00
@@ -546,6 +565,8 @@ void OvmsVehicleSmartEQ::NotifyVehicleIdling()
 void OvmsVehicleSmartEQ::NotifiedVehicleOn()
 {
   ESP_LOGI(TAG,"car is on");
+  m_12v_trickle_park_marker = 0;
+  m_12v_trickle_park_last_min = -1;
 }
 
 void OvmsVehicleSmartEQ::NotifiedVehicleOff()
